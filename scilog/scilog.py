@@ -152,6 +152,8 @@ def conduct(func, experiments=None, name=None, path='scilog', supp_data=None,
     '''
     if working_directory:
         link=[os.path.join(os.path.abspath(working_directory),f) for f in os.listdir(working_directory)]
+    else:
+        link=None
     if external:
         external_string=func
         def func(wd,*experiment):
@@ -198,6 +200,7 @@ def conduct(func, experiments=None, name=None, path='scilog', supp_data=None,
     STR_GIT_LOG = '#Created git commit {} in branch {} as snapshot of current state of git repository using the following commands:\n{}'.format('{}',STR_GIT_SCILOG,'{}')
     STR_COMMIT="For experiment with ID {} in {}"
     MSG_SOURCE = 'Could not find source code. Check {}'.format(stderr_file)
+    MSG_GIT_START = 'Creating git snapshot'
     ###########################################################################
     log = Log(write_filter=True, print_filter=True, file_name=log_file)
     ID = ''.join(random.choice(string.ascii_uppercase + string.digits) for _ in range(LEN_ID))
@@ -232,12 +235,14 @@ def conduct(func, experiments=None, name=None, path='scilog', supp_data=None,
     info['status'] = ['queued'] * n_experiments
     if git:
         try:
+            log.log(message=MSG_GIT_START)
             with capture_output() as c:
                 snapshot_id, git_log,_ = _git_snapshot(message=STR_COMMIT.format(ID,directory), path=module_path)
             _store_text(git_file, STR_GIT_LOG.format(snapshot_id, git_log))
             #if directory.startswith(os.path.abspath(git_directory)+os.sep):
             #log.log(group=GRP_WARN,message=MSG_WITHIN_GIT)
             log.log(message=MSG_GIT_DONE.format(snapshot_id, git_file))
+            info['gitcommit']=snapshot_id
         except GitError as e:
             _store_text(stderr_file, c.stderr + str('Problem with git snapshot. Check stash. '+e.message))
             _store_text(git_file, e.git_log)
@@ -900,10 +905,12 @@ def main():
     parser.add_argument('-s','--show',action='store_true',
         help=
         '''
-        Print information of previous entry. 
+        Print information of previous entry instead of creating new entry. 
         
         In this case, FUNC must be the path to a previous entry. 
-        Shell-style wildcards, e.g. 'foo*', are recognized
+        (Shell-style wildcards, e.g. 'foo*', are recognized)
+        Furthermore, the --git flag triggers an interactive view of the differences
+        of the working directory and the repository at the time of the creation of the scilog entry
         ''')
     parser.add_argument('-d','--directory',action='store',nargs='?',const='.',
         default=None,
@@ -913,7 +920,7 @@ def main():
         
         If no argument is specified, current working directory is used.
         ''')
-    args, _ = parser.parse_known_args()
+    args = parser.parse_args()
     if args.show:
         entries=load(search_pattern=args.func,no_results=True, need_unique=False)
         entries=list(entries)
@@ -923,6 +930,9 @@ def main():
             print('Entry \'{}\' at {}:'.format(entry[0]['name'],entry[1]))
             print('='*80)
             print(json.dumps(entry[0],sort_keys=True, indent=4,default=str)[1:-1])
+            if args.git:
+                print('\n The current working directory differs from the git repository at the time of the scilog entry as follows:')
+                subprocess.call(['gitdiffuntracked',entry[0]['gitcommit']])
     else:
         args.experiments = eval(args.experiments)
         init_dict = eval(args.base)

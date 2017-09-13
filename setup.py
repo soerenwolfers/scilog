@@ -11,5 +11,6 @@ setup(
     author_email='soeren.wolfers@gmail.com',
     packages=find_packages(exclude=['*tests']),#,'examples*']),
     install_requires=['swutil','IPython'],
+    scripts=['bin/gitdiffuntracked'],
     entry_points={'console_scripts': ['scilog = scilog.scilog:main']}
 )
