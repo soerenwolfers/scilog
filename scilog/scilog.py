@@ -31,6 +31,9 @@ import shlex
 import platform
 from pip import operations
 import json
+import contextlib
+import pathlib
+from functools import partial
 class GitError(Exception):
     def __init__(self, message, git_log):
         super(GitError, self).__init__(message)
@@ -66,7 +69,7 @@ LEN_TMP=8
 def conduct(func, experiments=None, name=None, path='scilog', supp_data=None,
             analyze=None, runtime_profile=False, memory_profile=False,
             git=False, no_date=False, no_dill=False, parallel=False, module_path=None,
-            external=False):
+            external=False,working_directory=None):
     '''   
     Call :code:`func` once for each item of :code:`experiments` and store
     results along with auxiliary information such as runtime and memory usage.
@@ -92,20 +95,20 @@ def conduct(func, experiments=None, name=None, path='scilog', supp_data=None,
             *status: Status of each experiment (list of ('queued'/'finished'/'failed'))
             *(optional)supp_data: Parameter :code:`supp_data`
         *stdout.txt
+        *(optional)stderr.txt
         *(optional)git.txt: stdout of git snapshot creation (in case this functionality ever crashes, you'll find your working tree in the stack, and this information should help with this)
         *results.pkl: List of results of experiments 
         *source.txt: Source code of the module containing :code:`func`
-        *(optional)stderr.txt
         *For each experiment a subdirectory "experiment<i>" with:
             *user_files/ (Working directory for call of :code:`func`)
-            *input.txt: Argument passed to :code:`func`
-            *(optional)stderr.txt:
-            *(optional)stdout.txt:
+            *(optional)input.txt: Argument passed to :code:`func`
+            *stderr.txt:
+            *stdout.txt:
             *(optional)runtime_profile.txt: Extensive runtime information for each experiment (list of strings)
             *(optional)memory_profile.txt: Memory usage information for each experiment (list of strings)
         *(optional) analysis/: output of function :analysis:
-            *(optional)stderr.txt
-            *(optional)stdout.txt
+            *stderr.txt
+            *stdout.txt
             *user_files/ (Working directory for call of :code:`analyze`
 
         
@@ -147,11 +150,13 @@ def conduct(func, experiments=None, name=None, path='scilog', supp_data=None,
         braces get replaced by the entries of :code:`experiments`
     :type external: String
     '''
+    if working_directory:
+        link=[os.path.join(os.path.abspath(working_directory),f) for f in os.listdir(working_directory)]
     if external:
         external_string=func
-        def func(*experiment):
-            out=subprocess.check_output(shlex.split(external_string.format(*experiment)),stderr=subprocess.STDOUT)
-            sys.stdout.write(out.decode("utf-8"))
+        def func(wd,*experiment):
+            subprocess.check_call(external_string.format(*experiment),cwd=wd,stdout=sys.stdout,stderr=sys.stderr,shell=True)
+            #subprocess.check_call(shlex.split(external_string.format(*experiment)),cwd=wd,stdout=sys.stdout,stderr=sys.stderr)
     if not name:
         if external:
             regexp = re.compile('\w+')
@@ -180,7 +185,7 @@ def conduct(func, experiments=None, name=None, path='scilog', supp_data=None,
     source_file_name = os.path.join(directory, 'source.txt')
     git_file = os.path.join(directory, 'git.txt')
     ###########################################################################
-    MSG_START = 'Starting scilog entry \'{}\' with ID \'{}\''
+    MSG_START = 'Creating scilog entry \'{}\' with ID \'{}\''
     MSG_EXPERIMENTS =('Running {} experiment{}'.format(n_experiments, 's' if n_experiments != 1 else '')
                 + (' with arguments: \n\t{}'.format('\n\t'.join(map(str, experiments))) if not no_arg_mode else '.'))
     MSG_INFO = 'This log and all outputs can be found in {}'.format(directory)
@@ -238,8 +243,9 @@ def conduct(func, experiments=None, name=None, path='scilog', supp_data=None,
             _store_text(git_file, e.git_log)
             log.log(group=GRP_ERR, message=MSG_ERROR_GIT)
             raise
-    info_list = [info, {'experiments':experiments},
-                 {'func': external_string if external else func.__repr__()}]
+    info_list = [info,{'func': external_string if external else func.__repr__()}]
+    if not no_arg_mode:
+        info_list.append({'experiments':experiments})
     if not no_dill:
         try: 
             import dill
@@ -275,7 +281,8 @@ def conduct(func, experiments=None, name=None, path='scilog', supp_data=None,
     locker=Locker()
     args = ((i, experiment, directory, func, analyze, memory_profile,
              runtime_profile, results_file, log_file, 
-             'pickle' if serializer == pickle else 'dill', no_arg_mode,locker,external) 
+             'pickle' if serializer == pickle else 'dill', no_arg_mode,locker,
+             external,link) 
             for i, experiment in enumerate(experiments))
     log.log(message=MSG_EXPERIMENTS)
     if parallel:
@@ -297,6 +304,8 @@ def conduct(func, experiments=None, name=None, path='scilog', supp_data=None,
         pool.join()
     else:
         for arg in args:
+            info['status'][arg[0]]='running'
+            store_info()
             output = _run_single_experiment(arg)
             _update_info(*output)
     os.chdir(old_wd)
@@ -343,7 +352,8 @@ def _get_system_info():
     
 def _run_single_experiment(arg):
     (i, experiment, directory, func, analyze, memory_profile,
-     runtime_profile, results_file, log_file, serializer, no_arg_mode,locker,external) = arg
+     runtime_profile, results_file, log_file, serializer, no_arg_mode,locker,external,
+     link) = arg
     ###########################################################################
     stderr_file = os.path.join(directory, 'stderr.txt')
     stderr_files = lambda i: os.path.join(directory, 'experiment{}'.format(i), 'stderr.txt')
@@ -384,7 +394,17 @@ def _run_single_experiment(arg):
     experiment_directory = experiment_user_directories(i)
     os.makedirs(experiment_directory)
     os.chdir(experiment_directory)
+    if external:
+        temp_func=partial(temp_func,experiment_directory)
+    for f in link:
+        root=pathlib.Path(f)
+        child=pathlib.Path(os.getcwd())
+        if not root in child.parents:
+            goal=os.path.basename(os.path.normpath(f))
+            os.symlink(f,goal)
     try:
+        if not no_arg_mode:
+            _store_text(input_files(i), str(experiment))
         if memory_profile:
             import memory_profiler
             m = StringIO()
@@ -392,29 +412,31 @@ def _run_single_experiment(arg):
         if runtime_profile:
             temp_func = add_runtime(temp_func)
         stderr_append = ""
-        with capture_output() as c:
-            tic = timeit.default_timer()
-            try:
-                if not external:
-                    random.seed(seed)
-                    if 'numpy' in sys.modules:
-                        import numpy
-                        numpy.random.seed(seed)
-                if no_arg_mode:
-                    output = temp_func()
-                else:
-                    output = temp_func(experiment)
-                status = 'finished'
-            except Exception:
-                status = 'failed'
-                stderr_append = traceback.format_exc()
+        with open(stderr_files(i), 'a',1) as err:
+            with open(stdout_files(i),'a',1) as out:
+                with contextlib.redirect_stdout(out):
+                    with contextlib.redirect_stderr(err):
+                        tic = timeit.default_timer()
+                        try:
+                            if not external:
+                                random.seed(seed)
+                                try:
+                                    import numpy
+                                    numpy.random.seed(seed)
+                                except ImportError:
+                                    pass
+                            if no_arg_mode:
+                                output = temp_func()
+                            else:
+                                output = temp_func(experiment)
+                            status = 'finished'
+                        except Exception:
+                            status = 'failed'
+                            stderr_append = traceback.format_exc()
         runtime = timeit.default_timer() - tic
         if stderr_append:
             log.log(group=GRP_ERR, message=MSG_FAILED_EXPERIMENT(i))
-        _store_text(stderr_files(i), c.stderr + stderr_append)
-        _store_text(stdout_files(i), c.stdout)
-        if not no_arg_mode:
-            _store_text(input_files(i), str(experiment))
+            _store_text(stderr_files(i), stderr_append)
         if runtime_profile: 
             profile, output = output
             s = BytesIO()
@@ -484,18 +506,20 @@ def analyze(func, search_pattern='*', path='', need_unique=False, log=None, no_d
         os.chdir(analysis_user_directory)
         output = None
         stderr_append = ""
-        with capture_output() as c:
-            try:
-                output = func(results, info)
-            except Exception:
-                stderr_append = traceback.format_exc()
+        with open(analysis_stderr_file, 'a',1) as err:
+            with open(analysis_stdout_file,'a',1) as out:
+                with contextlib.redirect_stdout(out):
+                    with contextlib.redirect_stderr(err):
+                        try:
+                            output = func(results, info)
+                        except Exception:
+                            stderr_append = traceback.format_exc()
         if stderr_append:
             if log:
                 log.log(group=GRP_ERR, message=MSG_FAILED_ANALYSIS(analysis_stderr_file))
             else:
                 warnings.warn(message=MSG_FAILED_ANALYSIS(analysis_stderr_file))
-        _store_text(analysis_stderr_file, c.stderr + stderr_append)
-        _store_text(analysis_stdout_file, c.stdout)
+        _store_text(analysis_stderr_file, stderr_append)
         if output:
             with open(analysis_output_file, 'wb') as fp:
                 try:
@@ -629,7 +653,7 @@ def _git_command(string,add_input=True):
     string='git '+string
     output='$ '+string+'\n' if add_input else ''
     args=shlex.split(string)
-    output+=subprocess.check_output(args,stderr=subprocess.STDOUT)
+    output+=subprocess.check_output(args,stderr=subprocess.STDOUT).decode('UTF8')
     return output
 def _git_id():
     return _git_command('log --format="%H" -n 1',add_input=False).rstrip()
@@ -737,7 +761,7 @@ def main():
             *(optional)stderr.txt
             *For each experiment a subdirectory "experiment<i>" with:
                 *user_files/ (Working directory for call of specified function)
-                *input.txt: String representation of arguments
+                *(optional)input.txt: String representation of arguments
                 *stderr.txt
                 *stdout.txt
                 *(optional)runtime_profile.txt: Extensive runtime information for each experiment (list of strings)
@@ -873,7 +897,7 @@ def main():
         This is only needed, when FUNC looks like a Python module, e.g.:
         FUNC=`foo.bar`
         ''')
-    parser.add_argument('-l','--load',action='store_true',
+    parser.add_argument('-s','--show',action='store_true',
         help=
         '''
         Print information of previous entry. 
@@ -881,8 +905,16 @@ def main():
         In this case, FUNC must be the path to a previous entry. 
         Shell-style wildcards, e.g. 'foo*', are recognized
         ''')
+    parser.add_argument('-d','--directory',action='store',nargs='?',const='.',
+        default=None,
+        help=
+        '''
+        Run FUNC with copy of specified directory as working directory
+        
+        If no argument is specified, current working directory is used.
+        ''')
     args, _ = parser.parse_known_args()
-    if args.load:
+    if args.show:
         entries=load(search_pattern=args.func,no_results=True, need_unique=False)
         entries=list(entries)
         print('Found {} entr{}'.format(len(entries),'y' if len(entries)==1 else 'ies'))
@@ -956,7 +988,8 @@ def main():
             no_date=args.no_date,
             no_dill=args.no_dill,
             parallel=args.parallel,
-            module_path=module_path
+            module_path=module_path,
+            working_directory=args.directory
         )
 if __name__ == '__main__':
     main()
