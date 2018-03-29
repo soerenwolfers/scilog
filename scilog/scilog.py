@@ -839,7 +839,7 @@ def main():
         a single dictionary and the contents of results.pkl into a single list,
         the Python function :code:`scilog.load` may be used.
 
-        To simply print the content of info.pkl, the switch --load may be used
+        To display information about an existing scilog entry, the switch --show may be used
         with this script.)
         ''')
     # parser.register('type', 'bool',
@@ -1002,7 +1002,7 @@ def main():
             except ImportError:
                 real_module_name = '.'.join(module_name.split('.')[:-1])
                 module = importlib.import_module(real_module_name)
-            try:  # Suppose class is last part of given module argument
+            try:  # Assume class is last part of given module argument
                 class_or_function_name = module_name.split('.')[-1]
                 cl_or_fn = getattr(module, class_or_function_name)
             except AttributeError:  # Or maybe last part but capitalized?
