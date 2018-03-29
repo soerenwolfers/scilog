@@ -9,7 +9,7 @@ import warnings
 import traceback
 from swutil import files, plots, validation
 from swutil.collections import unique
-from swutil.decorators import add_runtime, measure_memory_usage
+from swutil.decorators import add_runtime, print_peak_memory
 from swutil.logs import Log
 import pstats
 from io import StringIO
@@ -436,7 +436,7 @@ def _run_single_experiment(arg):
                 import memory_profiler
                 temp_func = memory_profiler.profile(func=temp_func, stream=m, precision=4)
             else:
-                temp_func = measure_memory_usage(func = temp_func, stream = m)
+                temp_func = print_peak_memory(func = temp_func, stream = m)
         if runtime_profile:
             temp_func = add_runtime(temp_func)
         stderr_append = ""
@@ -679,7 +679,7 @@ def _max_mem(m,type):
         matches = [find.match(line) for line in m.splitlines()]
         values = [float(match.groups()[0]) for match in matches if match is not None]
         return max(values) - min(values)
-    else:#Output of measure_memory_usage
+    else:#Output of print_peak_memory
         return float(m)
 
 def _get_directory(name, path, no_date):
