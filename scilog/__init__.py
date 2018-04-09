@@ -1,1 +1,1 @@
-from .scilog import record,load,analyze,ConvergencePlotter,Component
+from .scilog import record,load,analyze,ConvergencePlotter
