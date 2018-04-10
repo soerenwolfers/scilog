@@ -406,7 +406,8 @@ def record(func, inputs=None, name=None, directory=None, aux_data=None,
             if analysis:
                 _log.log(message=MSG_START_ANALYSIS)
                 try:
-                    entry = load(path=directory, need_unique=True, no_objects=False)
+                    with capture_output():
+                        entry = load(path=directory, need_unique=True, no_objects=False)
                     analyze(func=analysis, entry=entry, _log=_log, _err=_err, debug=debug)
                 except:
                     _err.log(message=traceback.format_exc())
@@ -549,7 +550,7 @@ class ConvergencePlotter():
                 times = np.cumsum(times)
             if not self.qois:
                 if hasattr(results[0], '__len__') and not isinstance(results[0], np.ndarray):
-                    self.qois = [lambda x:x[k] for k in range(len(results[0]))]
+                    self.qois = [lambda x,k = k: x[k] for k in range(len(results[0]))]
                 else:
                     self.qois = [lambda x:x]
             for (k, qoi) in enumerate(self.qois):

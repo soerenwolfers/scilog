@@ -25,4 +25,4 @@ class Meaner():
 
 if __name__ == "__main__":
     unittest.main()
-    record(func = Meaner().f,inputs = range(5),analysis = ConvergencePlotter(qois = 2,cumulative = True))
+    record(func = Meaner().f,inputs = range(5),analysis = ConvergencePlotter(cumulative = True))
