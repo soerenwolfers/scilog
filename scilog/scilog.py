@@ -21,6 +21,7 @@ import stat
 import argparse
 import ast
 import builtins
+import signal
 
 import numpy as np
 from matplotlib import pyplot
@@ -30,7 +31,8 @@ from swutil import sys_info, np_tools, plots, aux
 from swutil.validation import Positive, Integer
 from swutil.logs import Log
 from swutil.hpc import Locker
-from swutil.aux import random_string, string_dialog, no_context
+from swutil.aux import  string_dialog, no_context, random_word,\
+    string_from_seconds
 from swutil.files import append_text, delete_empty_files,\
     delete_empty_directories, find_directories
 from swutil.decorators import print_peak_memory, add_runtime
@@ -43,6 +45,7 @@ class GitError(Exception):
         
 GRP_WARN = 'Warning'
 GRP_ERROR = 'Error'
+FILE_DEBUG = '.debug'
 FILE_OUTPUT = 'output.pkl'
 FILE_INPUT = 'input.pkl'
 FILE_INFO = 'summary.txt'
@@ -60,10 +63,10 @@ FILE_WD = 'working_directory'
 FILE_ANALYSIS = 'analysis'
 FILE_EXP = lambda i: 'experiment{}'.format(i)
 FILE_RANDOMSTATE = 'randomstate.pkl'
-STR_GIT_TAG = lambda ID: '_scilogID{}'.format(ID)
+STR_GIT_TAG = lambda ID: 'scilog_{}'.format(ID)
 STR_GIT_LOG = lambda sha1, log: '#Created git commit {} as snapshot of current state of git repository using the following commands:\n{}'.format(sha1,log)
 STR_GIT_COMMIT_TITLE = lambda branch: 'Snapshot of working directory of branch {}'
-STR_GIT_COMMIT_BODY = lambda name, ID, directory: 'Created for scilog entry {} (ID: {}) in {}'.format(name,ID,directory)
+STR_GIT_COMMIT_BODY = lambda name, ID, directory: 'Created for scilog entry {}/{} in {}'.format(name,ID,directory)
 STR_LOADSCRIPT = ('#!/bin/sh \n '
                      + ' xterm -e {} -i -c '.format(sys.executable)
                      + r'''"
@@ -94,17 +97,21 @@ STR_GITDIFF = '\n The current working directory differs from the git repository 
 STR_ENTRY = lambda entry: ('=' * 80+'\nEntry \'{}\' at {}:\n'.format(entry['name'], entry['path'])
             + '=' * 80 + '\n' + json.dumps(entry, sort_keys=True, indent=4, default=str)[1:-1])
 STR_MULTI_ENTRIES = lambda n:'Found {} entries'.format(n)
-MSG_START_ENTRY = lambda name,ID: 'This is scilog entry \'{}\' (ID: {})'.format(name,ID)
-MSG_DEBUG = 'Scilog is run in debug mode. No git commit will be created, outputs and errors will be written directly to the log'
+MSG_DEBUG =  'Scilog is run in debug mode. Entry is not stored permanently, stdout and stderr are not captured, no git commit will be created'
 MSG_START_ANALYSIS = 'Updating analysis'
 MSG_START_EXPERIMENT = lambda i,inp: ('Running experiment {}'.format(i) + 
-        (' with argument:{} {}'.format('\n\t' if '\n' in inp else '',inp)
+        (' with input{} {}'.format('\n\t' if '\n' in repr(inp) else '',repr(inp))
           if inp is not None else ''))
-MSG_START_GIT = lambda repo,file:'Creating snapshot of current working tree of repository \'{}\'. Check {}'.format(repo,file)
-MSG_START_EXPERIMENTS = lambda n,no_arg_mode,inputs: ('Will run {} experiment{}'.format(n, 's' if n != 1 else '')
-                + (' with arguments: \n\t{}'.format('\n\t'.join(map(str, inputs))) if not no_arg_mode else '.'))   
-MSG_INFO = lambda directory: 'This entry is stored in {}'.format(directory)
-MSG_FINISH_EXPERIMENT = lambda i, runtime: 'Experiment {} finished (Elapsed time: {:.2f}s)'.format(i, runtime)
+MSG_START_GIT = lambda repo:'Creating snapshot of current working tree of repository \'{}\'. Check {}'.format(repo,FILE_GITLOG)
+def MSG_START_EXPERIMENTS(n,no_arg_mode,inputs):
+    msg = 'Will run {} experiment{}'.format(n, 's' if n != 1 else '')
+    if not no_arg_mode:
+        strings = list(map(repr,inputs))
+        sep = '\n\t' if any('\n' in s for s in strings) else ', '
+        msg += ' with inputs \n\t{}'.format(sep.join(strings))
+    return msg 
+MSG_START_ENTRY = lambda directory: 'Scilog entry {}'.format(directory)
+MSG_FINISH_EXPERIMENT = lambda i,runtime,result: 'Experiment {} finished (Elapsed time: {}){}'.format(i,string_from_seconds(runtime),'. Output: {}'.format(result))
 MSG_FINISH_ENTRY_SUCCESS = 'Scilog entry completed -- all experiments finished successfully'
 MSG_FINISH_ENTRY_FAIL = 'Scilog entry completed -- some experiments failed'
 MSG_FINISH_GIT = lambda sha1: 'Successfully created git commit {}'.format(sha1)
@@ -128,13 +135,14 @@ MSG_WARN_MEMPROF = 'Could not find memory_profiler. Install memory_profiler via 
 MSG_WARN_DILL = ('Could not find dill. Some items might not be storable. '
                   + 'Storage of numpy arrays will be slow'
                   + 'Install dill via `pip install dill`.')
+MSG_INTERRUPT = 'Kill signal received. Stored {}, closing now.'.format(FILE_INFO)
 LEN_ID = 8
 
 # TODO: Add keyword based load
 def record(func, inputs=None, name=None, directory=None, aux_data=None,
             analysis=None, runtime_profile=False, memory_profile=False,
             git=False, no_date=False, parallel=False,
-            external=False, copy_output = None, keywords=None):
+            external=False, copy_output = None, keywords=None,debug = None):
     '''
     Call :code:`func` and store results along with auxiliary information about
     runtime and memory usage, installed modules, source code, hardware, etc.
@@ -147,11 +155,11 @@ def record(func, inputs=None, name=None, directory=None, aux_data=None,
     the best subroutine in terms of runtime/memory/...).
     In the following, each call of :code:`func` is called an 'experiment'.
 
-    Scilog creates a directory, specified by :code:`name` and :code:`directory`,
-    with the following content:
+    Scilog creates a directory -- specified by :code:`directory`, :code:`name`, 
+    and a randomly generated ID -- with the following content:
         *summary.txt:
             *name: Name of scilog entry
-            *ID: Alphanumeric 8 character string identifying the entry
+            *ID: Alphanumeric string identifying the entry
             *modules: Module versions
             *time: Time of execution
             *experiments: For each experiment
@@ -208,7 +216,7 @@ def record(func, inputs=None, name=None, directory=None, aux_data=None,
     type memory_profile: Boolean
     :param git: Create git snapshot commit
         The resulting commit is tagged with the entry ID and resides outside the branch history
-        (Should you ever want get rid of the snapshots do `git tag -- list `_scilog*'|xargs -I % git tag -d %`)
+        (Should you ever want get rid of the snapshots do `git tag --list '_scilog*'|xargs -I % git tag -d %`)
         The explicit path may be specified, else it will be automatically detected
     :type git: Boolean or String
     :param no_date: Do not store outputs in sub-directories grouped by calendar week
@@ -219,13 +227,19 @@ def record(func, inputs=None, name=None, directory=None, aux_data=None,
     :type external: Boolean
     :param keywords: Keywords describing the entry further
     :type keywords: Set or dictionary
+    :param debug: Force debug mode (otherwise detected automatically)
+    :param debug: Boolean
     :param copy_output:  The contents of this directory will be copied into the scilog entry directory
     :type copy_output: String
     
     :return: Directory of scilog entry
     :rtype: String
     '''
-    debug = aux.isdebugging()
+    debug = debug if debug is not None else aux.isdebugging()
+    if debug: 
+        git = False
+    elif git is True:
+        git = os.path.dirname(sys.modules[func.__module__].__file__)
     if external:
         external_string = func
         def func(*experiment):
@@ -240,7 +254,7 @@ def record(func, inputs=None, name=None, directory=None, aux_data=None,
             except AttributeError:
                 name = func.__class__.__name__
     directory = directory or os.path.join(os.path.dirname(sys.modules[func.__module__].__file__),'scilog')
-    directory = _get_directory(name, directory, no_date, debug)
+    directory,ID = _get_directory(name, directory, no_date, debug,git)
     no_arg_mode = False
     if not inputs:
         no_arg_mode = True
@@ -264,10 +278,8 @@ def record(func, inputs=None, name=None, directory=None, aux_data=None,
     locker = Locker()
     _log = Log(write_filter=True, print_filter=True, file_name=log_file,lock = locker.get_lock())  # Logging strategy: 1) Redirect out and err of user functions (analysis and experiment) to their own files
     _err = Log(write_filter=True, print_filter=False, file_name=err_file,lock = locker.get_lock())  # 2) Log errors outside user functions in _err 3) Log everything (user-err and _err, as well as other info) in _log 
-    ID = random_string(LEN_ID)
-    _log.log(MSG_START_ENTRY(name, ID))
-    _log.log(MSG_INFO(directory))
-    if debug: _log.log(MSG_DEBUG)
+    _log.log(MSG_START_ENTRY(directory))
+    if debug: _log.log(group =GRP_WARN,message = MSG_DEBUG)
     info = dict()
     if keywords is None:  # Could be None if previous failed or because None are desired
         keywords = {}
@@ -279,11 +291,11 @@ def record(func, inputs=None, name=None, directory=None, aux_data=None,
             while True:
                 try:
                     keyword_string = string_dialog('scilog',STR_KEYWORDS_PROMPT)
-                except:
+                except Exception:
                     keyword_string = input(STR_KEYWORDS_PROMPT)
                 try:
                     keywords = ast.literal_eval('{'+keyword_string+'}')
-                except:
+                except (ValueError,SyntaxError):
                     warnings.warn(STR_KEYWORDS_FORMAT)
                 else:
                     break
@@ -327,16 +339,14 @@ def record(func, inputs=None, name=None, directory=None, aux_data=None,
             fp.write(STR_LOADSCRIPT)
         st = os.stat(load_file)
         os.chmod(load_file, st.st_mode | stat.S_IEXEC)
-    except:
+    except Exception:
         _err.log(message=traceback.format_exc())
         _log.log(group=GRP_WARN, message=MSG_WARN_LOADSCRIPT)
-    if git and not debug:
-        if git is True:
-            git = os.path.dirname(sys.modules[func.__module__].__file__)
+    if git:
         try:
-            _log.log(message=MSG_START_GIT(os.path.basename(os.path.normpath(git)), git_file))
+            _log.log(message=MSG_START_GIT(os.path.basename(os.path.normpath(git))))
             with (capture_output() if not debug else no_context()) as c:
-                snapshot_id, git_log, _ = _git_snapshot(message=STR_GIT_COMMIT_BODY(name, ID, directory), ID=ID, path=git)
+                snapshot_id, git_log, _ = _git_snapshot(path=git,commit_body=STR_GIT_COMMIT_BODY(name, ID, directory), ID=ID)
             append_text(git_file, STR_GIT_LOG(snapshot_id, git_log))
             _log.log(message=MSG_FINISH_GIT(snapshot_id))
             info['gitcommit'] = snapshot_id
@@ -372,6 +382,16 @@ def record(func, inputs=None, name=None, directory=None, aux_data=None,
             external, debug, copy_output)
             for i, input in enumerate(inputs))
     _log.log(message=MSG_START_EXPERIMENTS(n_experiments,no_arg_mode,inputs))
+    def handler_stop_signals(*args):
+        store_info()
+        _log.log(MSG_INTERRUPT)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        sys.exit(1)
+    signal.signal(signal.SIGINT, handler_stop_signals)
+    signal.signal(signal.SIGTERM, handler_stop_signals)
+    signal.signal(signal.SIGABRT,handler_stop_signals)
+    signal.signal(signal.SIGHUP,handler_stop_signals)
     if parallel and not debug:
         try:
             from pathos.multiprocessing import ProcessingPool as Pool
@@ -409,7 +429,7 @@ def record(func, inputs=None, name=None, directory=None, aux_data=None,
                     with capture_output():
                         entry = load(path=directory, need_unique=True, no_objects=False)
                     analyze(func=analysis, entry=entry, _log=_log, _err=_err, debug=debug)
-                except:
+                except Exception:
                     _err.log(message=traceback.format_exc())
                     _log.log(group=GRP_ERROR, message=MSG_EXCEPTION_ANALYSIS)
     os.chdir(old_wd)
@@ -436,7 +456,7 @@ def _run_single_experiment(arg):
     else:
         import dill
         serializer = dill
-    _log.log(MSG_START_EXPERIMENT(i,str(input) if not no_arg_mode else None))
+    _log.log(MSG_START_EXPERIMENT(i,input if not no_arg_mode else None))
     runtime = None
     output = None
     memory = None
@@ -458,15 +478,16 @@ def _run_single_experiment(arg):
     try:
         if not no_arg_mode:
             try_store(input,serializer,input_file,_log,_err)
-        if memory_profile is not False:
+        try_store(randomstate,serializer,randomstate_file,_log,_err)
+        if memory_profile == 'detail':#Needs to be before runtime decorator so it gets the full view (otherwise it will profile the runtime decorator)
             m = io.StringIO()
-            if memory_profile == 'detail':
-                import memory_profiler
-                temp_func = memory_profiler.profile(func=temp_func, stream=m, precision=4)
-            else:
-                temp_func = print_peak_memory(func=temp_func, stream=m)
+            import memory_profiler
+            temp_func = memory_profiler.profile(func = temp_func,stream =m ,precision = 4)
         if runtime_profile:
             temp_func = add_runtime(temp_func)
+        if memory_profile is True:#Needs to be after runtime decorator so runtime gets the full view (since peak_memory is threaded)
+            m = io.StringIO()
+            temp_func = print_peak_memory(func=temp_func, stream=m)
         stderr_append = ''
         with open(stderr_file, 'a', 1) as err:
             with open(stdout_file, 'a', 1) as out:
@@ -503,8 +524,6 @@ def _run_single_experiment(arg):
     except Exception:
         _err.log(message=traceback.format_exc())
         _log.log(group=GRP_ERROR, message=MSG_EXCEPTION_EXPERIMENT(i))
-    if status == 'finished':
-        _log.log(MSG_FINISH_EXPERIMENT(i, runtime))
     if copy_output is None:
         os.chdir(directory)
     else:
@@ -513,12 +532,13 @@ def _run_single_experiment(arg):
     output_str = str(output)
     try_store(output,serializer,output_file,_log,_err)
     del output
-    try_store(randomstate,serializer,randomstate_file,_log,_err)
+    if status == 'finished':
+        _log.log(MSG_FINISH_EXPERIMENT(i, runtime, output_str))
     gc.collect()
     return (i, runtime, status, memory, output_str)
 
 class ConvergencePlotter():
-    def __init__(self, *qois, cumulative=False, work=None, extrapolate=0):
+    def __init__(self, *qois, cumulative=False, work=None, extrapolate=0,reference = 'self'):
         '''
         Create convergence plots (of given quantities of interest (qois))
         
@@ -536,9 +556,11 @@ class ConvergencePlotter():
         self.cumulative = cumulative
         self.work = work
         self.extrapolate = extrapolate
+        self.reference = reference
     def __call__(self, entry):
         experiments = entry['experiments']
         results = experiments['output']
+        single_reference = (self.reference == 'self')
         ind_finished = [j for (j, status) in enumerate(experiments['status']) if status == 'finished']
         if len(ind_finished) > 2 + (self.extrapolate if self.extrapolate >= 0 else 0):
             if self.work is None:
@@ -553,6 +575,9 @@ class ConvergencePlotter():
                     self.qois = [lambda x,k = k: x[k] for k in range(len(results[0]))]
                 else:
                     self.qois = [lambda x:x]
+                    single_reference = True
+            if single_reference:
+                self.reference = [self.reference]*len(self.qois)
             for (k, qoi) in enumerate(self.qois):
                 try:
                     pyplot.figure(k).clf()
@@ -560,9 +585,9 @@ class ConvergencePlotter():
                     qoi_times = np.array(times)
                     if self.extrapolate:
                         qoi_values, qoi_times = np_tools.extrapolate(qoi_values, qoi_times, self.extrapolate)
-                    plots.plot_convergence(qoi_times, qoi_values) 
+                    plots.plot_convergence(qoi_times, qoi_values,reference = self.reference[k]) 
                     plots.save('convergence')
-                except:
+                except Exception:
                     traceback.print_exc()
                     
 def try_store(what,serializer,file,_log,_err):
@@ -574,7 +599,7 @@ def try_store(what,serializer,file,_log,_err):
             _err.log(message=traceback.format_exc())
             _log.log(group=GRP_WARN, message=MSG_EXCEPTION_STORE(os.path.split(file)[-1]))
 
-def analyze(func, entry, _log=None, _err=None, debug=False):
+def analyze(entry,func, _log=None, _err=None, debug=False):
     '''
     Add analysis to scilog entry or entries
     
@@ -595,40 +620,43 @@ def analyze(func, entry, _log=None, _err=None, debug=False):
         serializer = pickle
         _log.log(group=GRP_WARN, message=MSG_WARN_DILL)
     cwd = os.getcwd()
-    if not inspect.isgenerator(entry):
-        entries = [entry]
-    else:
-        entries = entry
-    for entry in entries:
-        analysis_directory_tmp = os.path.join(entry['path'], 'tmp',FILE_ANALYSIS)
-        working_directory = os.path.join(analysis_directory_tmp, FILE_WD)
-        stderr_file = os.path.join(analysis_directory_tmp, FILE_EXP_ERR)
-        stdout_file = os.path.join(analysis_directory_tmp, FILE_EXP_OUT)
-        output_file = os.path.join(analysis_directory_tmp, FILE_OUTPUT)
-        os.makedirs(analysis_directory_tmp)
-        os.mkdir(working_directory)
-        os.chdir(working_directory)
-        output = None
-        stderr_append = ''
-        with open(stderr_file, 'a', 1) as err:
-            with open(stdout_file, 'a', 1) as out:
-                with contextlib.redirect_stdout(out) if not debug else no_context():
-                    with contextlib.redirect_stderr(err) if not debug else no_context():
-                        try:
-                            output = func(entry)
-                        except Exception:
-                            stderr_append = traceback.format_exc()
-        delete_empty_files([stderr_file, stdout_file])
-        delete_empty_directories([working_directory])
-        if stderr_append:
-            append_text(stderr_file, stderr_append)
-            _log.log(group=GRP_ERROR, message=MSG_ERROR_ANALYSIS(stderr_file))
-        try_store(output,serializer,output_file,_log,_err)
+    try:
+        if not inspect.isgenerator(entry):
+            entries = [entry]
+        else:
+            entries = entry
+        for entry in entries:
+            analysis_directory_tmp = os.path.join(entry['path'], 'tmp',FILE_ANALYSIS)
+            working_directory = os.path.join(analysis_directory_tmp, FILE_WD)
+            stderr_file = os.path.join(analysis_directory_tmp, FILE_EXP_ERR)
+            stdout_file = os.path.join(analysis_directory_tmp, FILE_EXP_OUT)
+            output_file = os.path.join(analysis_directory_tmp, FILE_OUTPUT)
+            os.makedirs(analysis_directory_tmp)
+            os.mkdir(working_directory)
+            os.chdir(working_directory)
+            output = None
+            stderr_append = ''
+            with open(stderr_file, 'a', 1) as err:
+                with open(stdout_file, 'a', 1) as out:
+                    with contextlib.redirect_stdout(out) if not debug else no_context():
+                        with contextlib.redirect_stderr(err) if not debug else no_context():
+                            try:
+                                output = func(entry)
+                            except Exception:
+                                stderr_append = traceback.format_exc()
+            delete_empty_files([stderr_file, stdout_file])
+            delete_empty_directories([working_directory])
+            if stderr_append:
+                append_text(stderr_file, stderr_append)
+                _log.log(group=GRP_ERROR, message=MSG_ERROR_ANALYSIS(stderr_file))
+            try_store(output,serializer,output_file,_log,_err)
+            os.chdir(cwd)
+            analysis_directory = os.path.join(entry['path'], FILE_ANALYSIS)
+            shutil.rmtree(analysis_directory, ignore_errors=True)
+            shutil.move(analysis_directory_tmp, entry['path'])
+            shutil.rmtree(os.path.split(analysis_directory_tmp)[0], ignore_errors=True)
+    except Exception:
         os.chdir(cwd)
-        analysis_directory = os.path.join(entry['path'], FILE_ANALYSIS)
-        shutil.rmtree(analysis_directory, ignore_errors=True)
-        shutil.move(analysis_directory_tmp, entry['path'])
-        shutil.rmtree(os.path.split(analysis_directory_tmp)[0], ignore_errors=True)
         
 def _keyword_match(template, test):
     if isinstance(template,builtins.dict):
@@ -682,7 +710,7 @@ def load(search_pattern='*', path='', ID=None, no_objects=False, need_unique=Tru
                         with open(output_file_name, 'rb') as fp:
                             output = deserializer.load(fp)
                         info['experiments']['output'][j] = output
-                    except:
+                    except Exception:
                         warnings.warn(MSG_ERROR_LOAD('file ' + output_file_name))
                         traceback.print_exc()
                 if status != 'queued':#No need to load input of experiments that weren't even attempted to be started yet
@@ -691,7 +719,7 @@ def load(search_pattern='*', path='', ID=None, no_objects=False, need_unique=Tru
                         with open(input_file_name,'rb') as fp:
                             input = deserializer.load(fp)
                         info['experiments']['input'][j] = input
-                    except:
+                    except Exception:
                         warnings.warn(MSG_ERROR_LOAD('file ' + input_file_name))
                         traceback.print_exc()
         return info
@@ -724,25 +752,33 @@ def _max_mem(m, type):  # @ReservedAssignment
     else:  # Output of print_peak_memory
         return float(m)
 
-def _get_directory(name, path, no_date, debug):
+def _get_directory(name, path, no_date, debug, git):
     if no_date:
         basepath = os.path.join(path, name)
     else:
         date = datetime.date.today()
         basepath = os.path.join(path, date.strftime('w%Wy%y'), name)
-    if debug:
-        basepath = os.path.join(basepath, 'debug')
     basepath = os.path.abspath(basepath)
-    version = 0
-    while version < 10000:  # Larger number to avoid infinite loops
-        directory = os.path.join(basepath, 'v' + str(version))
+    if debug:
+        directory = os.path.join(basepath, FILE_DEBUG)
+        try:
+            shutil.rmtree(directory)
+        except FileNotFoundError:
+            pass
+        os.makedirs(directory)
+        return directory, FILE_DEBUG
+    for attempt in range(20):  # Try normal words, then ficticious ones, fail if cannot find unused
+        ID = random_word(length = LEN_ID,dictionary = (attempt<10))
+        directory = os.path.join(basepath,ID)
         try:
             os.makedirs(directory)
-            return directory
+            if git and _git_has_tag(git,STR_GIT_TAG(ID)):
+                delete_empty_directories([directory])
+            else:
+                return directory,ID
         except OSError as exc:
             if exc.errno != errno.EEXIST:
                 raise
-        version += 1
     raise ValueError(MSG_ERROR_DIR)
 
 def _git_command(string, add_input=True):
@@ -755,7 +791,17 @@ def _git_command(string, add_input=True):
 def _git_id():
     return _git_command('log --format="%H" -n 1', add_input=False).rstrip()
 
-def _git_snapshot(path, message, ID):
+def _git_has_tag(path,tag):
+    initial_directory = os.getcwd()
+    os.chdir(path)
+    try:
+        out = _git_command('tag --list',add_input = False)
+        return tag in out.splitlines() 
+    except subprocess.CalledProcessError:
+        os.chdir(initial_directory)
+        raise
+
+def _git_snapshot(path, commit_body, ID):
     initial_directory = os.getcwd()
     os.chdir(path)
     git_directory = _git_command('rev-parse --show-toplevel', add_input=False).rstrip()
@@ -766,13 +812,13 @@ def _git_snapshot(path, message, ID):
         out += _git_command('add --all')
         out += _git_command('rm -r --cached .')
         out += _git_command('add --all')
-        out += _git_command('commit --allow-empty -m "{0} \n {1}"'.format(STR_GIT_COMMIT_TITLE(active_branch), message))
+        out += _git_command('commit --allow-empty -m "{0} \n {1}"'.format(STR_GIT_COMMIT_TITLE(active_branch), commit_body))
         out += _git_command('tag {}'.format(STR_GIT_TAG(ID)))
         snap_id = _git_id()
         out += _git_command('reset HEAD~1')
     except subprocess.CalledProcessError as e:
         raise GitError(traceback.format_exc(), out + '\n' + str(e.output))
-    except:
+    except Exception:
         raise GitError(traceback.format_exc(), out)
     os.chdir(initial_directory)
     return snap_id, out, git_directory
@@ -1023,7 +1069,7 @@ def main():
                         analyze_fn = getattr(analyze_module, split_analyze[-1])
                     except AttributeError:  # is analyze maybe a function of class instance?
                         analyze_fn = getattr(fn, args.analyze)
-                except:
+                except Exception:
                     analyze_fn = None
                     traceback.print_exc()
                     warnings.warn(MSG_ERROR_LOAD('function {}'.format(args.analyze)))
