@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import timeit
 import pickle
 import os
@@ -13,15 +14,18 @@ import gc
 import inspect
 import importlib
 import re
+import types
 import subprocess
 import shlex
 import json
 import contextlib
 import stat
 import argparse
+import itertools
 import ast
 import builtins
 import signal
+from string import Formatter
 
 import numpy as np
 from matplotlib import pyplot
@@ -32,9 +36,9 @@ from swutil.validation import Positive, Integer
 from swutil.logs import Log
 from swutil.hpc import Locker
 from swutil.aux import  string_dialog, no_context, random_word,\
-    string_from_seconds
+    string_from_seconds,input_with_prefill,is_identifier
 from swutil.files import append_text, delete_empty_files,\
-    delete_empty_directories, find_directories
+    delete_empty_directories, find_directories, path_from_keywords
 from swutil.decorators import print_peak_memory, add_runtime
 from swutil.collections import unique
 
@@ -61,14 +65,14 @@ FILE_ERR = 'err.txt'
 FILE_SOURCE = 'source.txt'
 FILE_WD = 'working_directory'
 FILE_ANALYSIS = 'analysis'
-FILE_EXP = lambda i: 'experiment{}'.format(i)
+FILE_EXP = lambda i: f'experiment{i}'
 FILE_RANDOMSTATE = 'randomstate.pkl'
-STR_GIT_TAG = lambda ID: 'scilog_{}'.format(ID)
-STR_GIT_LOG = lambda sha1, log: '#Created git commit {} as snapshot of current state of git repository using the following commands:\n{}'.format(sha1,log)
-STR_GIT_COMMIT_TITLE = lambda branch: 'Snapshot of working directory of branch {}'
-STR_GIT_COMMIT_BODY = lambda name, ID, directory: 'Created for scilog entry {}/{} in {}'.format(name,ID,directory)
+STR_GIT_TAG = lambda ID: f'scilog_{ID}'
+STR_GIT_LOG = lambda sha1, log: f'#Created git commit {sha1} as snapshot of current state of git repository using the following commands:\n{log}'
+STR_GIT_COMMIT_TITLE = lambda branch: f'Snapshot of working directory of branch {branch}'
+STR_GIT_COMMIT_BODY = lambda name, ID, directory: f'Created for scilog entry {ID} in {directory}'
 STR_LOADSCRIPT = ('#!/bin/sh \n '
-                     + ' xterm -e {} -i -c '.format(sys.executable)
+                     + f' xterm -e {sys.executable} -i -c '
                      + r'''"
 print('>>> import scilog'); 
 import scilog;
@@ -86,47 +90,92 @@ STR_MEMFILE = lambda value,memory_profile: value + (
                     '' if memory_profile == 'detail' 
                     else 'MB (Use `memory_profile==\'detail\'` for a more detailed breakdown)'
                 )
-STR_SOURCE = lambda n, func, module,source: (('#Experiments were' if n != 1 else '#Experiment was')
-                + ' conducted with a {}'.format(func.__class__.__name__)
-               + (' called {}'.format(func.__name__) if hasattr(func, '__name__') else '')
-              + ' from the module {} whose source code is given below:\n{}'.format(module,source))
+STR_SOURCE = lambda n, func, module,source: (('#Experiments were conducted with' if n != 1 else '#Experiment was conducted with ')
+                + ('class' if inspect.isclass(func) else  
+                    (f'{func.__class__.__name__}' if isinstance(func,(types.MethodType,types.FunctinoType)) else 
+                    f'instance of {func.__class__.__name__}'))
+               + (f' called {func.__name__}' if hasattr(func, '__name__') else '')
+              + f' from the module {module} whose source code is given below:\n{source}')
 STR_TIME = '%y-%m-%d %H:%M:%S'
-STR_KEYWORDS_PROMPT = 'Enter keywords: '
-STR_KEYWORDS_FORMAT = 'Keywords must be passed in the form `<key>[,<key>]*` or `<key>:<value>[,<key>:<value>]*` where <key> and <value> are Python literals'
+def STR_PARAMETERS_PROMPT(func,external,current_parameters,allow_parameters,allow_variables,class_instance):
+    if class_instance:
+        why= f'to pass to instance of {func.__class__.__name__}'
+    else:
+        if external:
+            why = f'to fill in `{external}`'
+        else:
+            name = _get_name(func)
+            if inspect.isclass(func):
+                why= f'to initialize class {name}'
+            else:
+                why = f'to pass to {name}'
+    parameters_string = ', '.join(f'{key}={value}' for key,value in current_parameters.items())
+    require_parameters=[key for key in allow_parameters if key not in current_parameters]
+    if require_parameters:
+        parameters_string += (', ' if parameters_string else '') + ', '.join(f'{key}=' for key in require_parameters)
+    return f'>> Specify {"variables or " if allow_variables else ""}parameters {why} ({parameters_string}):\n\t'
+def STR_PARAMETERS_ALLOWED(passed_keys,known_keys):
+    forbidden = [key for key in passed_keys if key not in known_keys]
+    if len(forbidden)>1:
+        out = '!! Cannot specify parameters'+', '.join(f'`{key}`' for key in forbidden[:-1]) + f', and `{forbidden[-1]}`'
+    else:
+        out = '!! Cannot specify parameter '+f'`{forbidden[0]}`'
+    return out
+STR_PARAMETERS_FORMAT = '!! Input must have form `<key>=<value>[,<key>=<value>]*` -- Enter `help` for more information'
+STR_PARAMETERS_HELP = lambda allow_variables: (
+                            '?? Parameters are specified by `<key>=<value>` with <key> a Python identifier and <value> a Python expression.'
+                            +(
+                                (
+                                '\n?? Variables have the same syntax, except <value> has the form var(<iterable>).\n'
+                                '?? Variables are used to specify arguments that are varied in a specified range.\n'
+                                '?? Note the difference between <key>=[0,1] and <key>=var([0,1]):\n'
+                                '?? In the first case, `[0,1]` is passed at once; in the second case it is iterated over.'
+                                ) if allow_variables else ''
+                            )
+                        )
 STR_GITDIFF = '\n The current working directory differs from the git repository at the time of the scilog entry as follows:'
 STR_ENTRY = lambda entry: ('=' * 80+'\nEntry \'{}\' at {}:\n'.format(entry['name'], entry['path'])
             + '=' * 80 + '\n' + json.dumps(entry, sort_keys=True, indent=4, default=str)[1:-1])
-STR_MULTI_ENTRIES = lambda n:'Found {} entries'.format(n)
-MSG_DEBUG =  'Scilog is run in debug mode. Entry is not stored permanently, stdout and stderr are not captured, no git commit will be created'
+STR_MULTI_ENTRIES = lambda n:f'Found {n} entries'
+MSG_DEBUG =  'Running in debug mode. Entry is not stored permanently, stdout and stderr are not captured, no git commit is created'
 MSG_START_ANALYSIS = 'Updating analysis'
-MSG_START_EXPERIMENT = lambda i,inp: ('Running experiment {}'.format(i) + 
-        (' with input{} {}'.format('\n\t' if '\n' in repr(inp) else '',repr(inp))
-          if inp is not None else ''))
+MSG_START_EXPERIMENT = lambda i,n,inp: (f'Running experiment {i}/{n-1}' + 
+        (' with variable values {}{}'.format('\n\t' if '\n' in repr(inp) else '',repr(inp))
+          if inp != {} else ''))
 MSG_START_GIT = lambda repo:'Creating snapshot of current working tree of repository \'{}\'. Check {}'.format(repo,FILE_GITLOG)
-def MSG_START_EXPERIMENTS(n,no_arg_mode,inputs):
-    msg = 'Will run {} experiment{}'.format(n, 's' if n != 1 else '')
-    if not no_arg_mode:
-        strings = list(map(repr,inputs))
+def MSG_START_EXPERIMENTS(name,variables,parameters):
+    msg = f'Will call {name}'
+    extend=''
+    new_line=False
+    if parameters:
+        new_line='\n' in str(parameters) 
+        extend= ' with parameters {}{}'.format("\n\t" if new_line else "",parameters)
+    if variables:
+        strings = ["-'"+variable[0] + "' varying in `" +str(variable[1])+"`" for variable in variables]
         sep = '\n\t' if any('\n' in s for s in strings) else ', '
-        msg += ' with inputs \n\t{}'.format(sep.join(strings))
-    return msg 
-MSG_START_ENTRY = lambda directory: 'Scilog entry {}'.format(directory)
-MSG_FINISH_EXPERIMENT = lambda i,runtime,result: 'Experiment {} finished (Elapsed time: {}){}'.format(i,string_from_seconds(runtime),'. Output: {}'.format(result))
-MSG_FINISH_ENTRY_SUCCESS = 'Scilog entry completed -- all experiments finished successfully'
-MSG_FINISH_ENTRY_FAIL = 'Scilog entry completed -- some experiments failed'
-MSG_FINISH_GIT = lambda sha1: 'Successfully created git commit {}'.format(sha1)
+        extend += (' {}and variables'.format("\n" if new_line else "") if extend else ' with variables')+'\n\t{}'.format(sep.join(strings))
+    if not extend:
+        extend =' once'
+    return msg + extend
+MSG_START_ENTRY = lambda directory: f'Created scilog entry {directory}'
+MSG_FINISH_EXPERIMENT = lambda i,n,runtime,result,external: 'Finished experiment {}/{} in {}{}'.format(i,n-1,string_from_seconds(runtime),
+    '' if ('\n' in f'{result}') else (f'. Check {os.path.join(FILE_EXP(i),FILE_EXP_OUT)}' if external else f' with output {result}'))
+MSG_FINISH_ENTRY_SUCCESS = 'Completed scilog entry -- all experiments finished successfully'
+MSG_FINISH_ENTRY_FAIL = 'Completed scilog entry -- some experiments failed'
+MSG_FINISH_GIT = lambda sha1: f'Successfully created git commit {sha1}'
 MSG_ERROR_NOMATCH = 'Could not find matching scilog entry'
 MSG_ERROR_MULTIMATCH = lambda entries:'Multiple matching scilog entries (to iterate through all use need_unique=False):\n{}'.format('\n'.join(entries))
-MSG_ERROR_LOAD = lambda name: 'Error loading {}. Are all required modules in the Python path?'.format(name)
+MSG_ERROR_LOAD = lambda name: f'Error loading {name}. Are all required modules in the Python path?'
+MSG_ERROR_INSTANTIATION = lambda name:f'Could not instantiate class {name} with given parameters'
 MSG_ERROR_PARALLEL = 'Error during parallel execution. Try running with `parallel=False`'
 MSG_ERROR_BASH_ANALYSIS = 'Cannot analyze output in bash mode'
-MSG_ERROR_GIT = lambda file:'Error during git snapshot creation. Check {}'.format(file)
-MSG_ERROR_EXPERIMENT = lambda i,file:'Experiment {} failed. Check {}'.format(i, file)
-MSG_ERROR_ANALYSIS = lambda file: 'Analysis could not be completed. Check {}'.format(file)
+MSG_ERROR_GIT = lambda file:f'Error during git snapshot creation. Check {file}'
+MSG_ERROR_EXPERIMENT = lambda i:f'Experiment {i} failed. Check {os.path.join(FILE_EXP(i),FILE_EXP_ERR)}'.format(i, file)
+MSG_ERROR_ANALYSIS = lambda file: f'Analysis could not be completed. Check {file}'
 MSG_ERROR_DIR = 'Could not create scilog entry directory'
-MSG_EXCEPTION_STORE = lambda file: 'Could not store {}'.format(file)
+MSG_EXCEPTION_STORE = lambda file: f'Could not store {file}'
 MSG_EXCEPTION_ANALYSIS = 'Exception during online analysis'
-MSG_EXCEPTION_EXPERIMENT = lambda i:'Exception during execution of experiment {}'.format(i)
+MSG_EXCEPTION_EXPERIMENT = lambda i: f'Exception during handling of experiment {i}. Check {FILE_ERR}'
 MSG_WARN_SOURCE = 'Could not find source code'
 MSG_WARN_LOADSCRIPT = 'Error during load script creation'
 MSG_WARN_PARALLEL = ('Could not find pathos. This might cause problems with parallel execution.'
@@ -135,28 +184,30 @@ MSG_WARN_MEMPROF = 'Could not find memory_profiler. Install memory_profiler via 
 MSG_WARN_DILL = ('Could not find dill. Some items might not be storable. '
                   + 'Storage of numpy arrays will be slow'
                   + 'Install dill via `pip install dill`.')
-MSG_INTERRUPT = 'Kill signal received. Stored {}, closing now.'.format(FILE_INFO)
+MSG_INTERRUPT = f'Kill signal received. Stored {FILE_INFO}, closing now.'
 LEN_ID = 8
 
-# TODO: Add keyword based load
-def record(func, inputs=None, name=None, directory=None, aux_data=None,
+def record(func, variables=None, name=None, directory=None, aux_data=None,
             analysis=None, runtime_profile=False, memory_profile=False,
             git=False, no_date=False, parallel=False,
-            external=False, copy_output = None, keywords=None,debug = None):
+            copy_output = None, parameters=None,debug = None):
     '''
     Call :code:`func` and store results along with auxiliary information about
     runtime and memory usage, installed modules, source code, hardware, etc.
     
-    If :code:`inputs` is provided, then :code:`func` is called once for each entry
-    of :code:`inputs`.
-    For example, :code:`func` can be a numerical algorithm and :code:`inputs`
-    can be a list of different mesh resolutions (with the goal to assess 
-    convergence rates) a list of different subroutines (with the goal to find
-    the best subroutine in terms of runtime/memory/...).
+    code:`func` is called once for each combination of variable values as 
+    specified by the variable ranges in :code:`variables`.
+    For example, :code:`func` can be a numerical algorithm and :code:`variables`
+    can be used to specify different mesh resolutions as follow
+        `variables = {h:[2**(-l) for l in range(10)}` 
+    with the goal to assess the rate of convergence.
+    Another example would be to specify a list of subroutines with the goal to find
+    the best subroutine in terms of runtime/memory consumption/....
+
     In the following, each call of :code:`func` is called an 'experiment'.
 
     Scilog creates a directory -- specified by :code:`directory`, :code:`name`, 
-    and a randomly generated ID -- with the following content:
+    and optional parameters or a randomly generated ID -- with the following content:
         *summary.txt:
             *name: Name of scilog entry
             *ID: Alphanumeric string identifying the entry
@@ -167,9 +218,9 @@ def record(func, inputs=None, name=None, directory=None, aux_data=None,
                 *string representation of output,
                 *runtime
                 *status
-                *(optional)peak memory usage
-            *keywords: Further entry description
-            *(optional): git_commit
+                *(optional)memory usage
+            *(optional)parameters: Parameters that are equal for all experiments
+            *(optional)git_commit: SHA1 of git commit 
             *(optional)aux_data: Argument :code:`aux_data`
         *log.txt
         *(optional)err.txt
@@ -178,8 +229,8 @@ def record(func, inputs=None, name=None, directory=None, aux_data=None,
         *For each experiment a subdirectory 'experiment<i>' with:
             *output.pkl: Output of :code:`func`
             *(optional)input.pkl: Argument passed to :code:`func`
-            *(optional) working_directory/: Working directory for call of :code:`func`, 
-                unless parameter :code:`working_directory` is specified
+            *(optional)working_directory/: Working directory for call of :code:`func`, 
+                unless parameter :code:`copy_output` is specified
             *(optional)stderr.txt:
             *(optional)stdout.txt:
             *(optional)runtime_profile.txt: Extensive runtime information for each experiment
@@ -189,16 +240,15 @@ def record(func, inputs=None, name=None, directory=None, aux_data=None,
             *(optional)stdout.txt
             *(optional)working_directory/: Working directory for call of :code:`analysis`
 
-    To load the contents of summary.txt in Python, use the function :code:`scilog.load`.
-    That function additionally replaces the string representations of outputs and inputs in 
-    summary.txt by the actual Python object outputs and inputs. 
+    To load a scilog entry, use the function :code:`scilog.load`.
+    This function loads summary.txt and replaces the string representations of outputs and inputs
+    by the actual Python objects. 
 
     :param func: Function to be called with different experiment configurations
     :type func: function
-    :param inputs: List of inputs to :code:`func`. 
+    :param variables: Arguments for call of :code:`func` that are varied. 
         If not specified, then :code:`func` is called once, without arguments
-        If passed and integer, then `func` is called as often as specified, without arguments.
-    :type inputs: List(-like) or Integer
+    :type variables: List(-like) if single variable or dictionary of lists
     :param name: Name of scilog entry. 
         If not specified, :code:`func.__name__` is used
     :type name: String
@@ -216,58 +266,39 @@ def record(func, inputs=None, name=None, directory=None, aux_data=None,
     type memory_profile: Boolean
     :param git: Create git snapshot commit
         The resulting commit is tagged with the entry ID and resides outside the branch history
-        (Should you ever want get rid of the snapshots do `git tag --list '_scilog*'|xargs -I % git tag -d %`)
+        (Should you ever want get rid of the snapshots do `git tag --list 'scilog_*'|xargs -I % git tag -d %`)
         The explicit path may be specified, else it will be automatically detected
     :type git: Boolean or String
     :param no_date: Do not store outputs in sub-directories grouped by calendar week
     :type date: Boolean
-    :param external: Specify whether :code:`func` is a Python function or a string
-        representing an external call, such as 'echo {}'
-        If True, curly braces in the string get replaced by the items of :code:`inputs`
-    :type external: Boolean
-    :param keywords: Keywords describing the entry further
-    :type keywords: Set or dictionary
+    :param parameters: Parameters that are equal for all experiments
+        If :code:`func` is a class, these are used to instantiate this class
+    :type parameters: Dictionary
     :param debug: Force debug mode (otherwise detected automatically)
     :param debug: Boolean
     :param copy_output:  The contents of this directory will be copied into the scilog entry directory
     :type copy_output: String
-    
-    :return: Directory of scilog entry
+    :return: Path of scilog entry
     :rtype: String
     '''
+    ########################### FIX ARGUMENTS ###########################
+    name = name or _get_name(func)
+    external = _external(func) or False
     debug = debug if debug is not None else aux.isdebugging()
     if debug: 
         git = False
-    elif git is True:
-        git = os.path.dirname(sys.modules[func.__module__].__file__)
-    if external:
-        external_string = func
-        def func(*experiment):
-            subprocess.check_call(external_string.format(*experiment), stdout=sys.stdout, stderr=sys.stderr, shell=True)
-    if not name:
+    if git is True:
         if external:
-            oneword = re.compile('\w+')
-            name = oneword.match(external_string).group(0)
+            git = os.getcwd()
         else:
-            try:
-                name = func.__name__
-            except AttributeError:
-                name = func.__class__.__name__
-    directory = directory or os.path.join(os.path.dirname(sys.modules[func.__module__].__file__),'scilog')
-    directory,ID = _get_directory(name, directory, no_date, debug,git)
-    no_arg_mode = False
-    if not inputs:
-        no_arg_mode = True
-        parallel = False
-        inputs = [None]
-        n_experiments = 1
-    if (Positive & Integer).valid(inputs):
-        no_arg_mode = True
-        n_experiments = inputs
-        inputs = [None] * n_experiments
-    else:
-        inputs = list(inputs)
-        n_experiments = len(inputs)
+            git = os.path.dirname(sys.modules[func.__module__].__file__)
+    variables,parameters,func_initialized = _setup_experiments(variables,parameters,func,external)
+    t = itertools.product(*[variable[1] for variable in variables])
+    inputs = [{variable[0]:tt[i] for i,variable in enumerate(variables)} for tt in t]
+    n_experiments = len(inputs)
+    ########################### CREATE SCILOG ENTRY ###########################
+    base_directory = directory or (os.getcwd() if external else os.path.join(os.path.dirname(sys.modules[func.__module__].__file__),'scilog'))
+    directory,ID = _get_directory(name, base_directory, no_date, debug,git,parameters)
     log_file = os.path.join(directory, FILE_LOG)
     err_file = os.path.join(directory, FILE_ERR)
     info_file = os.path.join(directory, FILE_INFO)
@@ -279,40 +310,24 @@ def record(func, inputs=None, name=None, directory=None, aux_data=None,
     _log = Log(write_filter=True, print_filter=True, file_name=log_file,lock = locker.get_lock())  # Logging strategy: 1) Redirect out and err of user functions (analysis and experiment) to their own files
     _err = Log(write_filter=True, print_filter=False, file_name=err_file,lock = locker.get_lock())  # 2) Log errors outside user functions in _err 3) Log everything (user-err and _err, as well as other info) in _log 
     _log.log(MSG_START_ENTRY(directory))
-    if debug: _log.log(group =GRP_WARN,message = MSG_DEBUG)
+    if debug:
+        _log.log(group =GRP_WARN,message = MSG_DEBUG)
     info = dict()
-    if keywords is None:  # Could be None if previous failed or because None are desired
-        keywords = {}
-        try:
-            keywords = vars(func)
-        except TypeError:# func has no __dict__
-            pass
-        if not keywords:#empty
-            while True:
-                try:
-                    keyword_string = string_dialog('scilog',STR_KEYWORDS_PROMPT)
-                except Exception:
-                    keyword_string = input(STR_KEYWORDS_PROMPT)
-                try:
-                    keywords = ast.literal_eval('{'+keyword_string+'}')
-                except (ValueError,SyntaxError):
-                    warnings.warn(STR_KEYWORDS_FORMAT)
-                else:
-                    break
-    if isinstance(keywords,builtins.set):
-        keywords = {str(key): True for key in keywords}
-    else:
-        keywords = {str(key):str(keywords[key]) for key in keywords}
-    info['keywords'] = keywords
+    info['parameters'] = {key:repr(parameters[key]) for key in parameters}
+    info['variables'] = [repr(variable) for variable in variables]
     info['name'] = name
     info['ID'] = ID
     info['time'] = datetime.datetime.now().strftime(STR_TIME)
-    info['func'] = external_string if external else func.__repr__()
-    info['experiments'] = {'runtime':[None] * n_experiments, 'memory':[None] * n_experiments, 'output':[None] * n_experiments, 'status':['queued'] * n_experiments}
-    if not no_arg_mode:
-        info['experiments'].update({'input':[str(input) for input in inputs]})
-    if memory_profile is not False:
-        info['experiments'].update({'memory':[None] * n_experiments})
+    info['func'] = external or repr(func)
+    info['parallel'] = parallel
+    info['hardware'] = sys_info.hardware()
+    info['experiments'] = {
+        'runtime':[None] * n_experiments, 
+        'memory':[None] * n_experiments, 
+        'output':[None] * n_experiments, 
+        'status':['queued'] * n_experiments,
+        'input':[str(input) for input in inputs]
+    }
     if not external:
         info['modules'] = sys_info.modules()
         try:
@@ -323,12 +338,10 @@ def record(func, inputs=None, name=None, directory=None, aux_data=None,
             _log.log(group=GRP_WARN, message=MSG_WARN_SOURCE)
     else:
         info['modules'] = None
-    info['parallel'] = parallel
-    info['hardware'] = sys_info.hardware()
     if memory_profile is not False:
         if memory_profile == 'detail':
             try:
-                import memory_profiler  # @UnusedImport
+                import memory_profiler  # @UnusedImport, just to check if this will be possible in _run_single_experiment
             except ImportError:
                 _log.log(group=GRP_WARN, message=MSG_WARN_MEMPROF)
                 memory_profile = True
@@ -363,7 +376,7 @@ def record(func, inputs=None, name=None, directory=None, aux_data=None,
     except ImportError:
         serializer = pickle
         _log.log(group=GRP_WARN, message=MSG_WARN_DILL)
-    try_store(aux_data,serializer,aux_data_file,_log,_err)
+    _try_store(aux_data,serializer,aux_data_file,_log,_err)
     def _update_info(i, runtime, status, memory, output_str):
         info['experiments']['runtime'][i] = runtime
         if memory_profile is not False:
@@ -376,15 +389,20 @@ def record(func, inputs=None, name=None, directory=None, aux_data=None,
             json.dump(info,fp,indent = 1,separators = (',\n', ': '))
     store_info()
     old_wd = os.getcwd()
-    args = ((i, input, directory, func, memory_profile,
-             runtime_profile, _log,_err,
-             'pickle' if serializer == pickle else 'dill', no_arg_mode,
-            external, debug, copy_output)
-            for i, input in enumerate(inputs))
-    _log.log(message=MSG_START_EXPERIMENTS(n_experiments,no_arg_mode,inputs))
+    ########################### RUN EXPERIMENTS ###############################
+    args = (
+        (
+            i, input, directory, func_initialized, memory_profile,
+            runtime_profile, _log,_err,
+            'pickle' if serializer == pickle else 'dill',
+            external, debug, copy_output,n_experiments
+        )
+        for i, input in enumerate(inputs)
+    )
+    _log.log(message=MSG_START_EXPERIMENTS(name,variables,parameters))
     def handler_stop_signals(*args):
         store_info()
-        _log.log(MSG_INTERRUPT)
+        _log.log(MSG_INTERRUPT,use_lock=False)
         sys.stdout.flush()
         sys.stderr.flush()
         sys.exit(1)
@@ -404,7 +422,7 @@ def record(func, inputs=None, name=None, directory=None, aux_data=None,
         info['experiments']['status'] = ['running']*n_experiments
         try:
             outputs = pool.map(_run_single_experiment, args)
-        except _pickle.PicklingError:  # @UndefinedVariable
+        except pickle.PicklingError:  # @UndefinedVariable
             _err.log(message=traceback.format_exc())
             _log.log(group=GRP_ERROR, message=MSG_ERROR_PARALLEL)
             raise
@@ -424,7 +442,10 @@ def record(func, inputs=None, name=None, directory=None, aux_data=None,
             else:
                 _update_info(*output)
             if analysis:
-                _log.log(message=MSG_START_ANALYSIS)
+                try:
+                    _log.log(message=MSG_START_ANALYSIS)
+                except BrokenPipeError:#locks raise BrokenPipeError when experiments are terminated using <C-c>
+                    handler_stop_signals()
                 try:
                     with capture_output():
                         entry = load(path=directory, need_unique=True, no_objects=False)
@@ -438,10 +459,145 @@ def record(func, inputs=None, name=None, directory=None, aux_data=None,
              else MSG_FINISH_ENTRY_FAIL)
     return directory
 
+def _get_name(func):
+    if _external(func): 
+        oneword = re.compile('\w+')
+        name = oneword.match(func).group(0)
+    else:
+        try:#func is a function or a class
+            name = func.__name__
+        except AttributeError:#func is an object with __call__ method
+            name = func.__class__.__name__
+    return name
+
+def _setup_experiments(variables,parameters,func,external):
+    class var:
+        def __init__(self,*obj):
+            if len(obj)>1:
+                self.obj = obj
+            elif len(obj)==1:
+                self.obj=obj[0]
+            elif len(obj)==0:
+                raise ValueError()
+        def __repr__(self):
+            return 'var('+repr(self.obj)+')'
+    def _get_kwargs(func,external,variables,parameters,class_instance=False):
+        if inspect.isclass(func):
+            allow_variables =False
+            variables = None
+        else:
+            allow_variables=True
+        parameters_passed = parameters is not None
+        variables_passed = variables is not None
+        if parameters is None:
+            parameters = {}
+        if variables is None:
+            variables = {}
+        if external:
+            field_names = [fname for _, fname, _, _ in Formatter().parse(external)]
+            new_var_n = 0
+            new_names = []
+            for i,fname in enumerate(field_names):
+                if fname == '':
+                    while True:
+                        if f'arg{new_var_n}' not in field_names:
+                            new_names.append(f'arg{new_var_n}')
+                            break
+                        else:
+                            new_var_n+=1
+            external = external.format(
+                *[f'{{{new_name}}}' for new_name in new_names],
+                **{fname:f'{{{fname}}}' for fname in field_names if fname !='' }
+            )
+            known_keys = [fname for _, fname, _, _ in Formatter().parse(external)]
+            allow_all_keys = False
+            default_parameters = {}
+        else:
+            func_parameters = inspect.signature(func).parameters
+            default_parameters = {
+                key:value.default for i,(key,value) in enumerate(func_parameters.items()) 
+                if (value.default != inspect._empty)
+            }
+            allow_all_keys = any(value.kind ==4 for key,value in func_parameters.items())
+            known_keys = [
+                key for i,(key,value) in enumerate(func_parameters.items())
+                if (value.kind not in [2,4])
+            ]
+        kwargs=default_parameters
+        free_keys=lambda : allow_all_keys or known_keys
+        required_keys=lambda : [key for key in known_keys if key not in kwargs]
+        is_allowed_key=lambda key: allow_all_keys or key in known_keys
+        if variables:
+            if not isinstance(variables,dict):
+                if known_keys:
+                    variables={known_keys[0]:variables}
+                else:
+                    raise ValueError(f'Must specify name for variable {variables}')
+            if any(not is_allowed_key(key) or not is_identifier(key) for key in variables):
+                raise ValueError('Invalid variable names: {}'.format({key for key in variables if not is_allowed_key(key)}))
+            variables_update = {key:var(value) for key,value in variables.items()}
+        else:
+            variables_update = {}
+        if parameters:
+            if any(key in variables_update for key in parameters):
+                raise ValueError('Parameter names already defined as variables: {}'.format({key for key in parameters if key in kwargs}))
+            if any(not is_allowed_key(key) or not is_identifier(key) for key in parameters):
+                raise ValueError('Invalid parameter names: {}'.format({key for key in parameters if not is_allowed_key(key)}))
+            parameters_update = parameters
+        else:
+            parameters_update = parameters
+        kwargs.update(**variables_update,**parameters_update)
+        if (((not parameters_passed and not class_instance) or (not variables_passed and allow_variables)) and free_keys()) or required_keys(): 
+            while True:
+                prefill=', '.join([key+'=' for key in required_keys()])
+                parameters_string = input_with_prefill(STR_PARAMETERS_PROMPT(func,external,kwargs,known_keys,allow_variables,class_instance),prefill)
+                if parameters_string in ['?','help','--help','??']:
+                    print(STR_PARAMETERS_HELP(allow_variables))
+                    continue
+                try:
+                    update_kwargs = eval(f'(lambda **kwargs: kwargs)({parameters_string})',{'__builtins__':None},{'var':var} if allow_variables else {})#ast.literal_eval('{'+parameters_string+'}')
+                except Exception:#(ValueError,SyntaxError):
+                    if '=help' in parameters_string:
+                        print(STR_PARAMETERS_HELP(allow_variables))
+                    else:
+                        print(STR_PARAMETERS_FORMAT)
+                else:
+                    kwargs.update({key: value for key,value in update_kwargs.items() if is_allowed_key(key)})
+                    done = True
+                    if not all(key in kwargs for key in known_keys):
+                        if parameters_string =='':
+                            print(STR_PARAMETERS_FORMAT)
+                        done = False
+                    if any(not is_allowed_key(key) for key in update_kwargs):
+                        print(STR_PARAMETERS_ALLOWED(update_kwargs,known_keys))
+                        done = False
+                    if done:
+                        break
+        return kwargs,external
+    if external:
+        def func(**kwargs):
+            subprocess.check_call(external.format(**kwargs), stdout=sys.stdout, stderr=sys.stderr, shell=True)
+    if inspect.isclass(func):# in this case, parameters are for initialization and variables for function call
+        parameters,_ = _get_kwargs(func,False,None,parameters)
+        func_initialized=func(**parameters)
+        variables,_ = _get_kwargs(func_initialized,False,variables,None,class_instance=True)
+        variables = {key:(value.obj if isinstance(value,var) else [value]) for key,value in variables.items()}
+    else:
+        kwargs,external =_get_kwargs(func,external,variables,parameters)
+        variables = {key:value.obj for key,value  in kwargs.items() if isinstance(value,var)}
+        parameters ={key:value for key,value in kwargs.items() if not isinstance(value,var)}
+        def func_initialized(**experiment):
+            return func(**experiment,**parameters)
+    variables = list(variables.items())
+    return variables,parameters,func_initialized
+
+def _external(func):
+    return func if isinstance(func,str) else False
+
 def _run_single_experiment(arg):
     (i, input, directory, func, memory_profile,
-     runtime_profile, _log,_err, serializer, no_arg_mode,
-     external, debug, copy_output) = arg
+     runtime_profile, _log,_err, serializer,
+     external, debug, copy_output,n_experiments) = arg
     experiment_directory = os.path.join(directory, FILE_EXP(i))
     stderr_file = os.path.join(experiment_directory, FILE_EXP_ERR)
     stdout_file = os.path.join(experiment_directory, FILE_EXP_OUT)
@@ -456,7 +612,7 @@ def _run_single_experiment(arg):
     else:
         import dill
         serializer = dill
-    _log.log(MSG_START_EXPERIMENT(i,input if not no_arg_mode else None))
+    _log.log(MSG_START_EXPERIMENT(i,n_experiments,input))
     runtime = None
     output = None
     memory = None
@@ -468,17 +624,18 @@ def _run_single_experiment(arg):
             randomstate = numpy.random.get_state()
         except ImportError:
             pass  # Random state only needs to be saved if numpy is used
-    if hasattr(func, '__name__'):
+    if hasattr(func, '__name__'):#func is function
         temp_func = func
-    else:
+    else:#func is object
         temp_func = func.__call__
     if copy_output is None:
         os.makedirs(experiment_working_directory)
         os.chdir(experiment_working_directory)
+    else:
+        os.makedirs(experiment_directory)
     try:
-        if not no_arg_mode:
-            try_store(input,serializer,input_file,_log,_err)
-        try_store(randomstate,serializer,randomstate_file,_log,_err)
+        _try_store(input,serializer,input_file,_log,_err)
+        _try_store(randomstate,serializer,randomstate_file,_log,_err)
         if memory_profile == 'detail':#Needs to be before runtime decorator so it gets the full view (otherwise it will profile the runtime decorator)
             m = io.StringIO()
             import memory_profiler
@@ -495,12 +652,11 @@ def _run_single_experiment(arg):
                     with contextlib.redirect_stderr(err) if not debug else no_context():
                         tic = timeit.default_timer()
                         try:
-                            if no_arg_mode:
-                                output = temp_func()
-                            else:
-                                output = temp_func(input)
+                            output = temp_func(**input)
                         except Exception:
                             status = 'failed'
+                            if debug:
+                                traceback.print_exc()
                             stderr_append = traceback.format_exc()
                         else:
                             status = 'finished'
@@ -508,7 +664,7 @@ def _run_single_experiment(arg):
         runtime = timeit.default_timer() - tic
         if status == 'failed':
             append_text(stderr_file, stderr_append)
-            _log.log(group=GRP_ERROR, message=MSG_ERROR_EXPERIMENT(i,stderr_file))
+            _log.log(group=GRP_ERROR, message=MSG_ERROR_EXPERIMENT(i),use_lock = False)#locks are often broken already which leads to ugly printouts, also errors don't matter at this point anyway
         else:
             if runtime_profile:
                 profile, output = output
@@ -530,10 +686,10 @@ def _run_single_experiment(arg):
         shutil.copytree(copy_output, experiment_working_directory, symlinks=False, ignore_dangling_symlinks=True)
     delete_empty_directories([experiment_working_directory])
     output_str = str(output)
-    try_store(output,serializer,output_file,_log,_err)
+    _try_store(output,serializer,output_file,_log,_err)
     del output
     if status == 'finished':
-        _log.log(MSG_FINISH_EXPERIMENT(i, runtime, output_str))
+        _log.log(MSG_FINISH_EXPERIMENT(i, n_experiments, runtime, output_str,external))
     gc.collect()
     return (i, runtime, status, memory, output_str)
 
@@ -590,7 +746,7 @@ class ConvergencePlotter():
                 except Exception:
                     traceback.print_exc()
                     
-def try_store(what,serializer,file,_log,_err):
+def _try_store(what,serializer,file,_log,_err):
     if what is not None:
         try:
             with open(file, 'wb') as fp:
@@ -598,6 +754,18 @@ def try_store(what,serializer,file,_log,_err):
         except (TypeError, pickle.PicklingError):
             _err.log(message=traceback.format_exc())
             _log.log(group=GRP_WARN, message=MSG_EXCEPTION_STORE(os.path.split(file)[-1]))
+
+def _clean_repository(directory):
+    os.chdir(directory)
+    tags = _git_command('tag --list',add_input = False).splitlines()
+    git_directory = _git_command('rev-parse --show-toplevel', add_input=False).rstrip()
+    os.chdir(git_directory)
+    dirs = [os.path.basename(x[0]) for x in os.walk(os.getcwd())]
+    scilog_tag = re.compile('scilog_.*')
+    for tag in tags:
+        if scilog_tag.match(tag) and not list(load(ID=tag[7:],no_objects=True,need_unique=False)):
+            print('Removing tag {}'.format(tag))
+            _git_command('tag -d {}'.format(tag))
 
 def analyze(entry,func, _log=None, _err=None, debug=False):
     '''
@@ -649,7 +817,7 @@ def analyze(entry,func, _log=None, _err=None, debug=False):
             if stderr_append:
                 append_text(stderr_file, stderr_append)
                 _log.log(group=GRP_ERROR, message=MSG_ERROR_ANALYSIS(stderr_file))
-            try_store(output,serializer,output_file,_log,_err)
+            _try_store(output,serializer,output_file,_log,_err)
             os.chdir(cwd)
             analysis_directory = os.path.join(entry['path'], FILE_ANALYSIS)
             shutil.rmtree(analysis_directory, ignore_errors=True)
@@ -659,12 +827,9 @@ def analyze(entry,func, _log=None, _err=None, debug=False):
         os.chdir(cwd)
         
 def _keyword_match(template, test):
-    if isinstance(template,builtins.dict):
-        return all(key in test and re.search(template[key],test[key]) for key in template)
-    else:
-        return all(key in test for key in template)
+    return all(key in test and re.search(template[key],test[key]) for key in template)
               
-def load(search_pattern='*', path='', ID=None, no_objects=False, need_unique=True,keywords = None):
+def load(search_pattern='*', path='', ID=None, no_objects=False, need_unique=True,parameters = None):
     '''
     Load scilog entry/entries.
    
@@ -675,10 +840,12 @@ def load(search_pattern='*', path='', ID=None, no_objects=False, need_unique=Tru
     :type search_pattern: String, e.g. search_pattern='foo*' matches `foobar`
     :param path: Path of exact location is known (possibly only partially), relative or absolute
     :type path: String, e.g. '/home/work/2017/6/<name>' or 'work/2017/6'
-    :param no_objects: Only load information about scilog entry, not results
+    :param no_objects: To save time, only load information about scilog entry, not results
     :type no_objects: Boolean
     :param need_unique: Require unique identification of scilog entry.
     :type need_unique: Boolean
+    :param parameters: Search pattern that is applied to the scilog parameters
+    :type parameters: Dictionary of regular expression strings or objects (which will be converted to strings)
     :return: Scilog entry
     :rtype: If need_unique=True, a single Namespace obejct
         If need_unique=False, a generator of such objects
@@ -696,6 +863,7 @@ def load(search_pattern='*', path='', ID=None, no_objects=False, need_unique=Tru
             path, search_pattern = temp_path, temp_search_pattern
     entries.extend(find_directories(search_pattern, path=path))
     entries.extend(find_directories('*/' + search_pattern, path=path))
+    print(entries)
     entries = [entry for entry in entries if _is_experiment_directory(entry)]
     def get_output(entry, no_objects):
         file_name = os.path.join(entry, FILE_INFO)
@@ -725,9 +893,10 @@ def load(search_pattern='*', path='', ID=None, no_objects=False, need_unique=Tru
         return info
     if ID:
         partial_id = re.compile(ID)
-        entries = filter(lambda entry: partial_id.match(get_output(entry, no_objects = True).ID),entries)
-    if keywords:
-        entries = filter(lambda entry: _keyword_match(keywords,get_output(entry,no_objects = True).keywords),entries)
+        entries = filter(lambda entry: partial_id.match(get_output(entry, no_objects = True)['ID']),entries)
+    if parameters:
+        parameters = {key:repr(value) for (key,value) in parameters}
+        entries = filter(lambda entry: _keyword_match(parameters,get_output(entry,no_objects = True)['parameters']),entries)
     entries = unique(entries)
     if not need_unique:
         return (get_output(entry, no_objects=no_objects) for entry in entries)
@@ -752,7 +921,7 @@ def _max_mem(m, type):  # @ReservedAssignment
     else:  # Output of print_peak_memory
         return float(m)
 
-def _get_directory(name, path, no_date, debug, git):
+def _get_directory(name, path, no_date, debug, git, parameters):
     if no_date:
         basepath = os.path.join(path, name)
     else:
@@ -767,9 +936,13 @@ def _get_directory(name, path, no_date, debug, git):
             pass
         os.makedirs(directory)
         return directory, FILE_DEBUG
-    for attempt in range(20):  # Try normal words, then ficticious ones, fail if cannot find unused
+    try_parameter_based_directory= 0 if parameters else -1
+    for attempt in range(20):  # Try keyword format, then random words, fail if cannot find unused
         ID = random_word(length = LEN_ID,dictionary = (attempt<10))
-        directory = os.path.join(basepath,ID)
+        if try_parameter_based_directory>=0:
+            directory = os.path.join(basepath,path_from_keywords(parameters,into='file')+f'_{try_parameter_based_directory}')
+        else:
+            directory = os.path.join(basepath,ID)
         try:
             os.makedirs(directory)
             if git and _git_has_tag(git,STR_GIT_TAG(ID)):
@@ -777,8 +950,14 @@ def _get_directory(name, path, no_date, debug, git):
             else:
                 return directory,ID
         except OSError as exc:
-            if exc.errno != errno.EEXIST:
-                raise
+            if exc.errno == errno.EEXIST:
+                if try_parameter_based_directory>=0:
+                    try_parameter_based_directory += 1
+            else:
+                if try_parameter_based_directory>=0:#There was a problem creating a directory with the keyword format
+                    try_parameter_based_directory=-1#Maybe illegal characters in parameters, try it with random words
+                else:#Already tried random words, something else is wrong
+                    raise
     raise ValueError(MSG_ERROR_DIR)
 
 def _git_command(string, add_input=True):
@@ -824,22 +1003,22 @@ def _git_snapshot(path, commit_body, ID):
     return snap_id, out, git_directory
 
 def main():
-    import textwrap as _textwrap
-    class LineWrapRawTextHelpFormatter(argparse.RawDescriptionHelpFormatter):
-        def _split_lines(self, text, width):
-            text = self._whitespace_matcher.sub(' ', text).strip()
-            return _textwrap.wrap(text, width)
-    parser = argparse.ArgumentParser(formatter_class=LineWrapRawTextHelpFormatter,
+    import textwrap
+    parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter,
         description=
         '''
         Call FUNC and store results along with auxiliary information about
         runtime and memory usage, installed modules, source code, hardware, etc.
         
-        If INPUTS is provided, then FUNC is called once for each entry of INPUTS.
-        For example, FUNC can be a numerical algorithm and INPUTS
-        can be a list of different mesh resolutions (with the goal to assess 
-        convergence rates) a list of different subroutines (with the goal to find
-        the best subroutine in terms of runtime/memory/...).
+        FUNC is called once for each combination of variable values as 
+        specified by the variable ranges in VARIABLES.
+        For example, FUNC can be a numerical algorithm and VARIABLES
+        can be used to specify different mesh resolutions via
+            -v "h=[2**(-l) for l in range(10)]" 
+        with the goal to assess the rate of convergence.
+        Another example would be to specify a list of subroutines with the goal to find
+        the best subroutine in terms of runtime/memory consumption/....
+
         In the following, each call of FUNC is called an 'experiment'.
 
         Scilog creates a directory (using NAME and the current date, and optionally DIRECTORY)
@@ -874,151 +1053,132 @@ def main():
                 *(optional)stdout.txt
                 *(optional)working_directory/: Working directory for call of ANALYZE
 
-        To load the contents of summary.txt in Python, use the function :code:`scilog.load`.
-        That function additionally replaces the string representations of outputs and inputs in 
-        summary.txt by the actual Python-object outputs and inputs. 
-
         To display information about an existing scilog entry in the command line,
-        the switch --show may be used with this script.)
+        the argument --show may be passed to this script.)
         ''')
-    parser.add_argument("func", action='store',
-        help=
-        '''
-        The function that is executed
-
-        The standard way is to provide the full path of a Python function
-            e.g.: `foo.func`.
-
-        There are three alternatives:
-            1) Provide the full name of a module that contains a class of the same name (up to capitalization).
-                e.g.: `foo.bar`
-
-            2) Provide the full name of a class.
-                e.g.: `foo.bar.Bar2`
-
-            3) Provide a bash command string, 
-                e.g.: `echo {}s`
-
-        In cases 1) and 2), the specified class is instantiated once
-         and all experiments are performed by calling this instance.
-        In case 3), curly braces in the command string are replaced by the inputs 
-        ''')
-    parser.add_argument('-i', '--inputs', action='store', default='None',
-        help=
-        '''
-        List of inputs.
-
-        e.g.: [2**l for l in range(10)]
-
-        If not specified, FUNC is called once without arguments.
-
-        If FUNC is a bash command string, inputs must be a list strings
-        ''')
-    parser.add_argument('-b', '--base', action='store', default='{}',
-        help=
-        '''
-        Base configuration (in form of a dictionary) for all experiments.
-
-        If argument FUNC is a function, this dictionary is passed
+    parser.add_argument('func', action='store',
+        help=textwrap.dedent(
+        '''\
+        Function to be called
+        The standard way to specify FUNC is to provide the full path of a Python class or function definition,
+            e.g.: `foo.bar` where `foo` is a module in the Python search path and `bar` is a class or function in `foo`.
+        If `foo` contains a class or function of the same name, then specification of `foo` suffices. 
+        Alternatively, a bash command string may be provided,
+                e.g.: "echo 'Hello {}'".
+        In the standard case, the entries of INPUTS are passed to the specified class or function one after another.
+        If a class is specified, it is instantiated only once and the __call__ method of the instance is called.
+        In the alternative case, curly braces in the command string are replaced by the entries of INPUTS .
+        '''))
+    parser.add_argument('-v', '--variables', action='store', default='None',
+        help=textwrap.dedent(
+        '''\
+        Dict of variable ranges or single variable range 
+        Different syntax possibilities:
+             1) Single iterable expression, e.g.: "range(10)"
+             2) Single or multiple kwargs-style expresions  "N=range(10),M=range(3)"
+             3) Dictionary "{'N':range(10),'M':range(3)}"
+        '''))
+    parser.add_argument('-p', '--parameters', action='store', default='None',
+        help=textwrap.dedent(
+        '''\
+        Parameters that are equal for all experiments
+        Different syntax possibilities:
+             1) kwarg-style, e.g.: "h=0.1,eps=0.01"
+             2) dictionary-style: "{'h':0.1,'eps':0.01}".
+        If argument FUNC is a function, PARAMETERS are passed
         along the entries of INPUTS in form of keyword arguments to FUNC.
-
-        If argument FUNC specifies a class, the class is instantiated using
-        this dictionary in form of keyword arguments.
-
-        If argument FUNC is a bash command string, the entries of this dictionary
+        If argument FUNC specifies a class, the class is initialized
+        with PARAMETERS as keyword arguments.
+        If argument FUNC is a bash command string, PARAMETERS
         are used to fill named braces after the intial empty braces, 
-            e.g.: if FUNC is "my_func {} -d {dir}" and BASE is "{'dir':'/my/path'}" 
-             and INPUTS is 'range(2)', then the following experiments will be run:
+            e.g.: if FUNC is "my_func {} -d {dir}" and PARAMETERS is "dir='/my/path'" 
+             and VARIABLES is "range(2)", then the following experiments will be run:
                  1) my_func 0 -d /my/path
-                 2) my_func 1 -d /my/path
-        Note that '/my/path' can be replaced by any valid Python expression that returns a string.
-        ''')
+                 2) my_func 1 -d /my/path.
+            ('/my/path' can be replaced by any Python expression (which will then be converted to a string))
+        '''))
     parser.add_argument('-n', '--name', action='store', default=None,
-        help=
-        '''
-        Name of the scilog entry.
-
-        If not provided, the name is derived from FUNC
-        ''')
+        help=textwrap.dedent(
+        '''\
+        Name of the scilog entry
+        If not provided, name is derived from FUNC.
+        '''))
     parser.add_argument('-a', '--analyze', action='store',
         nargs='?', const='analyze', default=None,
-        help=
-        '''
+        help=textwrap.dedent(
+        '''\
         Function that is used to perform analysis after each experiment.
-        
-        By default, ANALYZE is the name of a function in the same module as FUNC.
-
+        By default, ANALYZE is assumed to be the name of a function in the same module as FUNC.
         Alternatively, ANALYZE can be
             1) a full name of a function in some different module,
                 e.g.: foo2.analyze
-
-            2) a name of a method of the class specified by FUNC
-        ''')
-    parser.add_argument('-d', '--directory', action='store', default='scilog',
-        help=
-        '''
-        Specify where scilog entry should be stored
-        ''')
-    parser.add_argument('-p', '--parallel', action='store_true',
-        help=
-        '''
+            2) a name of a method of the class specified by FUNC.
+        '''))
+    parser.add_argument('-d', '--directory', action='store', default=None,
+        help=textwrap.dedent(
+        '''\
+        Specify where scilog entry should be stored.
+        '''))
+    parser.add_argument('--parallel', action='store_true',
+        help=textwrap.dedent(
+        '''\
         Perform experiments in parallel.
-        ''')
+        '''))
     parser.add_argument('-m', '--memory_profile', action='store_true',
-        help=
-        '''
-        Store memory information for each experiment
-        ''')
+        help=textwrap.dedent(
+        '''\
+        Store memory information for each experiment.
+        '''))
     parser.add_argument('-r', '--runtime_profile', action='store_true',
-        help=
-        '''
+        help=textwrap.dedent(
+        '''\
         Store extensive runtime information for each experiment.
-
         The total time of each experiment is always stored.
-        ''')
+        '''))
     parser.add_argument('-g', '--git', action='store_true',
-        help=
-        '''
-        Create git snapshot commit
-        
+        help=textwrap.dedent(
+        '''\
+        Create git snapshot commit.
         The resulting commit is tagged with the entry ID and resides outside
-        the branch history
-        
-        Add 'scilog' to your .gitignore to avoid storing the scilog entries in each snapshot 
-        ''')
+        the branch history.
+        Add 'scilog' to your .gitignore to avoid storing the scilog entries in each snapshot .
+        '''))
     parser.add_argument('--no_date', action='store_true',
-        help=
-        '''
+        help=textwrap.dedent(
+        '''\
         Do not store scilog entry in subdirectories based on current date.
-        ''')
+        '''))
+    parser.add_argument('--debug',action = 'store_true',
+        help=textwrap.dedent(
+        '''\
+        Run scilog in debug mode.
+        '''))
     parser.add_argument('--external', action='store_true',
-        help=
-        '''
+        help=textwrap.dedent(
+        '''\
         Specify that FUNC describes an external call.
-        
         This is only needed, when FUNC could be confused for a Python module, 
-        e.g., when FUNC=`foo.bar`
-        ''')
+        e.g., when FUNC=`foo.sh`.
+        '''))
     parser.add_argument('-s', '--show', action='store_true',
-        help=
-        '''
-        Print information of previous entry instead of creating new entry.
-
+        help=textwrap.dedent(
+        '''\
+        Print information of previous entry/entries instead of creating new entry.
         In this case, FUNC must the path of an existing scilog entry.
-        (Shell-style wildcards, e.g. 'foo*', are recognized)
-        Furthermore, the --git flag can be used to show an interactive view of
-        the differences of the working directory and the repository at the time
-        of the creation of the scilog entry
-        ''')
+        (Shell-style wildcards, e.g. "foo*", are recognized.)
+        Furthermore, the --git flag can be used to show the differences of the
+        working directory and the repository at the time
+        of the creation of the scilog entry.
+        '''))
     parser.add_argument('-c', '--copy', action='store', nargs='?', const='.',
         default=None,
-        help=
-        '''
-        Specify directory where FUNC stores its output
-
-        If no argument is specified, FUNC will be run in a clean working directory
-        and it is assumed that its outputs are stored in that working directory
-        ''')
+        help=textwrap.dedent(
+        '''\
+        Specify directory where FUNC stores its output.
+        If flag is not specified, FUNC will be run in a clean working directory
+        and it is assumed that its outputs are stored in that working directory.
+        If flag is specified without path, current working directory is used.
+        '''))
     args = parser.parse_args()
     if args.show:
         entries = load(search_pattern=args.func, no_objects=True, need_unique=False)
@@ -1031,71 +1191,64 @@ def main():
                 print(STR_GITDIFF)
                 subprocess.call(['gitdiffuntracked', entry[0]['gitcommit']])
     else:
-        inputs = eval(args.inputs)
-        init_dict = eval(args.base)
-        module_name = args.func
+        try:
+            variables = eval(f'(lambda **kwargs: kwargs)({args.variables})',{'__builtins__':None},{})
+        except Exception:   
+            variables = eval(args.variables)
+        try:
+            parameters = eval(f'(lambda **kwargs: kwargs)({args.parameters})',{'__builtins__':None},{})
+        except Exception:
+            parameters = eval(args.parameters)
         python_function_s = re.compile('(\w+\.)+(\w+)')
-        external = args.external or not python_function_s.match(module_name)
-        if not external:
-            try:
+        external = args.external or not python_function_s.match(args.func)
+        if not external:#Assume args.func describes a Python class or function
+            try:#Assume that args.func is a module path containing class or function of same name
+                module = importlib.import_module(args.func)
+            except ImportError:#Assume that args.func is module path plus trailing function or class name
+                module_name = '.'.join(args.func.split('.')[:-1])
                 module = importlib.import_module(module_name)
-            except ImportError:
-                real_module_name = '.'.join(module_name.split('.')[:-1])
-                module = importlib.import_module(real_module_name)
-            try:  # Assume class is last part of given module argument
-                class_or_function_name = module_name.split('.')[-1]
-                cl_or_fn = getattr(module, class_or_function_name)
-            except AttributeError:  # Or maybe last part but capitalized?
-                class_or_function_name = class_or_function_name.title()
-                cl_or_fn = getattr(module, class_or_function_name)
-            if args.name == '_':
-                args.name = class_or_function_name
-            if inspect.isclass(cl_or_fn):
-                fn = cl_or_fn(**init_dict)
-            else:
-                if init_dict:
-                    def fn(*experiment):  # Need to pass experiment as list, to be able to handle zero-argument calls
-                        return cl_or_fn(*experiment, **init_dict)
-                else:
-                    fn = cl_or_fn
-            if args.analyze:
+            try: #Assume class is last part of args.func argument
+                class_or_function_name = args.func.split('.')[-1]
+                func = getattr(module, class_or_function_name)
+            except AttributeError as ae1:  # Or maybe last part but capitalized?
+                class_or_function_name2 = class_or_function_name.title()
                 try:
-                    split_analyze = args.analyze.split('.')
-                    try:
-                        if len(split_analyze) > 1:  # Analyze function in different module
-                            analyze_module = importlib.import_module('.'.join(split_analyze[:-1]))
-                        else:
-                            analyze_module = module
-                        analyze_fn = getattr(analyze_module, split_analyze[-1])
-                    except AttributeError:  # is analyze maybe a function of class instance?
-                        analyze_fn = getattr(fn, args.analyze)
-                except Exception:
-                    analyze_fn = None
-                    traceback.print_exc()
-                    warnings.warn(MSG_ERROR_LOAD('function {}'.format(args.analyze)))
-            else:
+                    func = getattr(module, class_or_function_name2)
+                except AttributeError:
+                    raise ValueError(f'{class_or_function_name} is not a callable or class in module {module.__name__}') from None
+        else:#Assume the module describes an external call
+            func = args.func
+        if args.analyze:
+            try:
+                split_analyze = args.analyze.split('.')
+                try:
+                    if len(split_analyze) > 1:  # Analyze function in different module
+                        analyze_module = importlib.import_module('.'.join(split_analyze[:-1]))
+                    else:
+                        analyze_module = module
+                    analyze_fn = getattr(analyze_module, split_analyze[-1])
+                except AttributeError:  # is analyze maybe a function of class instance?
+                    analyze_fn = getattr(func, args.analyze)
+            except Exception:
                 analyze_fn = None
-            module_path = os.path.dirname(module.__file__)
-        else:  # Assume the module describes an external call
-            module_name.format('{}', **init_dict)
-            fn = module_name
-            if args.analyze:
-                raise ValueError(MSG_ERROR_BASH_ANALYSIS)
+                traceback.print_exc()
+                warnings.warn(MSG_ERROR_LOAD('function {}'.format(args.analyze)))
+        else:
             analyze_fn = None
-            module_path = os.getcwd()
         record(
-            func=fn, directory=args.directory,
-            inputs=inputs,
+            func=func, 
+            directory=args.directory,
+            variables=variables,
             name=args.name,
-            external=external,
             analysis=analyze_fn,
             runtime_profile=args.runtime_profile,
             memory_profile=args.memory_profile,
             git=args.git,
             no_date=args.no_date,
             parallel=args.parallel,
-            git_path=module_path,
-            copy_output=args.copy
+            copy_output=args.copy,
+            debug = args.debug,
+            parameters=parameters
         )
 if __name__ == '__main__':
     main()
