@@ -755,17 +755,28 @@ def _try_store(what,serializer,file,_log,_err):
             _err.log(message=traceback.format_exc())
             _log.log(group=GRP_WARN, message=MSG_EXCEPTION_STORE(os.path.split(file)[-1]))
 
-def _clean_repository(directory):
+def clean_git_repository(directory=None,dry_run = True):
+    directory = directory or os.getcwd()
     os.chdir(directory)
-    tags = _git_command('tag --list',add_input = False).splitlines()
+    scilog_tag = re.compile('scilog_.*')
+    tags = [tag for tag in _git_command('tag --list',add_input = False).splitlines() if scilog_tag.match(tag)]
     git_directory = _git_command('rev-parse --show-toplevel', add_input=False).rstrip()
     os.chdir(git_directory)
     dirs = [os.path.basename(x[0]) for x in os.walk(os.getcwd())]
-    scilog_tag = re.compile('scilog_.*')
-    for tag in tags:
-        if scilog_tag.match(tag) and not list(load(ID=tag[7:],no_objects=True,need_unique=False)):
-            print('Removing tag {}'.format(tag))
-            _git_command('tag -d {}'.format(tag))
+    entries = load(need_unique=False,no_objects=True)
+    IDs = [entry['ID'] for entry in entries]
+    unmatched = [tag for tag in tags if tag[7:] not in IDs]
+    if unmatched:
+        print(f'The following scilog git commits have no matching scilog entry in {directory}:')
+        [print(tag) for tag in unmatched]
+        if dry_run:
+            print('Specify `dry_run=False` to remove unmatched commits')
+        else:
+            print('Removing unmatched commits...',end='')
+            [_git_command(f'tag -d {tag}') for tag in unmatched]
+            print('done')
+    else:
+        print(f'All scilog git commits have matching scilog entries in {directory}')
 
 def analyze(entry,func, _log=None, _err=None, debug=False):
     '''
@@ -863,12 +874,14 @@ def load(search_pattern='*', path='', ID=None, no_objects=False, need_unique=Tru
             path, search_pattern = temp_path, temp_search_pattern
     entries.extend(find_directories(search_pattern, path=path))
     entries.extend(find_directories('*/' + search_pattern, path=path))
-    print(entries)
     entries = [entry for entry in entries if _is_experiment_directory(entry)]
     def get_output(entry, no_objects):
         file_name = os.path.join(entry, FILE_INFO)
         with open(file_name, 'r') as fp:
-            info = json.load(fp)
+            try:
+                info = json.load(fp)
+            except Exception:
+                raise ValueError(f'Problem with {file_name}') 
         info['path'] = entry
         if not no_objects:
             for (j, status) in enumerate(info['experiments']['status']):
