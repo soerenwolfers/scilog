@@ -25,6 +25,7 @@ import itertools
 import ast
 import builtins
 import signal
+from collections import OrderedDict
 from string import Formatter
 
 import numpy as np
@@ -92,12 +93,12 @@ STR_MEMFILE = lambda value,memory_profile: value + (
                 )
 STR_SOURCE = lambda n, func, module,source: (('#Experiments were conducted with' if n != 1 else '#Experiment was conducted with ')
                 + ('class' if inspect.isclass(func) else  
-                    (f'{func.__class__.__name__}' if isinstance(func,(types.MethodType,types.FunctinoType)) else 
+                    (f'{func.__class__.__name__}' if isinstance(func,(types.MethodType,types.FunctionType)) else 
                     f'instance of {func.__class__.__name__}'))
                + (f' called {func.__name__}' if hasattr(func, '__name__') else '')
               + f' from the module {module} whose source code is given below:\n{source}')
 STR_TIME = '%y-%m-%d %H:%M:%S'
-def STR_PARAMETERS_PROMPT(func,external,current_parameters,allow_parameters,allow_variables,class_instance):
+def STR_PARAMETERS_PROMPT(func,external,current_parameters,known_parameters,allow_variables,class_instance,allow_all_keys):
     if class_instance:
         why= f'to pass to instance of {func.__class__.__name__}'
     else:
@@ -110,12 +111,14 @@ def STR_PARAMETERS_PROMPT(func,external,current_parameters,allow_parameters,allo
             else:
                 why = f'to pass to {name}'
     parameters_string = ', '.join(f'{key}={value}' for key,value in current_parameters.items())
-    require_parameters=[key for key in allow_parameters if key not in current_parameters]
+    require_parameters=[key for key in known_parameters if key not in current_parameters]
     if require_parameters:
         parameters_string += (', ' if parameters_string else '') + ', '.join(f'{key}=' for key in require_parameters)
+    if allow_all_keys:
+        parameters_string += '[, <kwarg>=<value>]*'
     return f'>> Specify {"variables or " if allow_variables else ""}parameters {why} ({parameters_string}):\n\t'
-def STR_PARAMETERS_ALLOWED(passed_keys,known_keys):
-    forbidden = [key for key in passed_keys if key not in known_keys]
+def STR_PARAMETERS_ALLOWED(passed_keys,known_parameters):
+    forbidden = [key for key in passed_keys if key not in known_parameters]
     if len(forbidden)>1:
         out = '!! Cannot specify parameters'+', '.join(f'`{key}`' for key in forbidden[:-1]) + f', and `{forbidden[-1]}`'
     else:
@@ -139,7 +142,7 @@ STR_ENTRY = lambda entry: ('=' * 80+'\nEntry \'{}\' at {}:\n'.format(entry['name
 STR_MULTI_ENTRIES = lambda n:f'Found {n} entries'
 MSG_DEBUG =  'Running in debug mode. Entry is not stored permanently, stdout and stderr are not captured, no git commit is created'
 MSG_START_ANALYSIS = 'Updating analysis'
-MSG_START_EXPERIMENT = lambda i,n,inp: (f'Running experiment {i}/{n-1}' + 
+MSG_START_EXPERIMENT = lambda i,n,inp: (f'Running experiment {i+1}/{n}' + 
         (' with variable values {}{}'.format('\n\t' if '\n' in repr(inp) else '',repr(inp))
           if inp != {} else ''))
 MSG_START_GIT = lambda repo:'Creating snapshot of current working tree of repository \'{}\'. Check {}'.format(repo,FILE_GITLOG)
@@ -151,15 +154,18 @@ def MSG_START_EXPERIMENTS(name,variables,parameters):
         new_line='\n' in str(parameters) 
         extend= ' with parameters {}{}'.format("\n\t" if new_line else "",parameters)
     if variables:
-        strings = ["-'"+variable[0] + "' varying in `" +str(variable[1])+"`" for variable in variables]
-        sep = '\n\t' if any('\n' in s for s in strings) else ', '
-        extend += (' {}and variables'.format("\n" if new_line else "") if extend else ' with variables')+'\n\t{}'.format(sep.join(strings))
+        s_var = 'variables' if len(variables)>1 else 'variable'
+        variable_strings = [(variable[0],str(variable[1])) for variable in variables]
+        newline_in_vs = any('\n' in vs[1] for vs in variable_strings)
+        sep = '\n\t' if (len(variables)>1 or newline_in_vs) else ', '
+        strings = [('' if sep == ', ' else  '-') +"'"+vs[0] + ("' varying in `" +vs[1]+"`" if not newline_in_vs else '') for vs in variable_strings]
+        extend += (" \n" if new_line else " ") +(f'and {s_var}' if extend else f' with {s_var}')+(' ' if sep==', ' else sep)+sep.join(strings)
     if not extend:
         extend =' once'
     return msg + extend
 MSG_START_ENTRY = lambda directory: f'Created scilog entry {directory}'
-MSG_FINISH_EXPERIMENT = lambda i,n,runtime,result,external: 'Finished experiment {}/{} in {}{}'.format(i,n-1,string_from_seconds(runtime),
-    '' if ('\n' in f'{result}') else (f'. Check {os.path.join(FILE_EXP(i),FILE_EXP_OUT)}' if external else f' with output {result}'))
+MSG_FINISH_EXPERIMENT = lambda i,n,runtime,result,external: 'Finished experiment {}/{} in {}{}'.format(i+1,n,string_from_seconds(runtime),
+    '' if ('\n' in f'{result}') else (f'. Check {os.path.join(FILE_EXP(i),FILE_EXP_OUT)}' if external else f'. Output: {result}'))
 MSG_FINISH_ENTRY_SUCCESS = 'Completed scilog entry -- all experiments finished successfully'
 MSG_FINISH_ENTRY_FAIL = 'Completed scilog entry -- some experiments failed'
 MSG_FINISH_GIT = lambda sha1: f'Successfully created git commit {sha1}'
@@ -170,7 +176,7 @@ MSG_ERROR_INSTANTIATION = lambda name:f'Could not instantiate class {name} with 
 MSG_ERROR_PARALLEL = 'Error during parallel execution. Try running with `parallel=False`'
 MSG_ERROR_BASH_ANALYSIS = 'Cannot analyze output in bash mode'
 MSG_ERROR_GIT = lambda file:f'Error during git snapshot creation. Check {file}'
-MSG_ERROR_EXPERIMENT = lambda i:f'Experiment {i} failed. Check {os.path.join(FILE_EXP(i),FILE_EXP_ERR)}'.format(i, file)
+MSG_ERROR_EXPERIMENT = lambda i:f'Experiment {i} failed. Check {os.path.join(FILE_EXP(i),FILE_EXP_ERR)}'
 MSG_ERROR_ANALYSIS = lambda file: f'Analysis could not be completed. Check {file}'
 MSG_ERROR_DIR = 'Could not create scilog entry directory'
 MSG_EXCEPTION_STORE = lambda file: f'Could not store {file}'
@@ -192,8 +198,8 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
             git=False, no_date=False, parallel=False,
             copy_output = None, parameters=None,debug = None):
     '''
-    Call :code:`func` and store results along with auxiliary information about
-    runtime and memory usage, installed modules, source code, hardware, etc.
+    Call :code:`func` once or multiple times and store results along with auxiliary information
+    about runtime and memory usage, installed modules, source code, hardware, etc.
     
     code:`func` is called once for each combination of variable values as 
     specified by the variable ranges in :code:`variables`.
@@ -266,8 +272,11 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
     type memory_profile: Boolean
     :param git: Create git snapshot commit
         The resulting commit is tagged with the entry ID and resides outside the branch history
-        (Should you ever want get rid of the snapshots do `git tag --list 'scilog_*'|xargs -I % git tag -d %`)
-        The explicit path may be specified, else it will be automatically detected
+        The repository path may be specified, else it will be automatically detected
+        Add 'scilog' to your .gitignore to avoid storing the scilog entries in each snapshot.  
+        (Should you ever want get rid of the snapshots, 
+        use `git tag --list 'scilog_*'|xargs -I % git tag -d %` to remove all scilog commits or 
+        use function `clean_git_repository` to remove all scilog commits whose scilog entry does not reside in repository anymore)
     :type git: Boolean or String
     :param no_date: Do not store outputs in sub-directories grouped by calendar week
     :type date: Boolean
@@ -292,13 +301,13 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
             git = os.getcwd()
         else:
             git = os.path.dirname(sys.modules[func.__module__].__file__)
-    variables,parameters,func_initialized = _setup_experiments(variables,parameters,func,external)
+    variables,parameters,func_initialized,classification = _setup_experiments(variables,parameters,func,external)
     t = itertools.product(*[variable[1] for variable in variables])
     inputs = [{variable[0]:tt[i] for i,variable in enumerate(variables)} for tt in t]
     n_experiments = len(inputs)
     ########################### CREATE SCILOG ENTRY ###########################
     base_directory = directory or (os.getcwd() if external else os.path.join(os.path.dirname(sys.modules[func.__module__].__file__),'scilog'))
-    directory,ID = _get_directory(name, base_directory, no_date, debug,git,parameters)
+    directory,ID = _get_directory(name, base_directory, no_date, debug,git,classification)
     log_file = os.path.join(directory, FILE_LOG)
     err_file = os.path.join(directory, FILE_ERR)
     info_file = os.path.join(directory, FILE_INFO)
@@ -470,17 +479,17 @@ def _get_name(func):
             name = func.__class__.__name__
     return name
 
+class _var:
+    def __init__(self,*obj):
+        if len(obj)>1:
+            self.obj = obj
+        elif len(obj)==1:
+            self.obj=obj[0]
+        elif len(obj)==0:
+            raise ValueError()
+    def __repr__(self):
+        return 'var('+repr(self.obj)+')'
 def _setup_experiments(variables,parameters,func,external):
-    class var:
-        def __init__(self,*obj):
-            if len(obj)>1:
-                self.obj = obj
-            elif len(obj)==1:
-                self.obj=obj[0]
-            elif len(obj)==0:
-                raise ValueError()
-        def __repr__(self):
-            return 'var('+repr(self.obj)+')'
     def _get_kwargs(func,external,variables,parameters,class_instance=False):
         if inspect.isclass(func):
             allow_variables =False
@@ -509,33 +518,36 @@ def _setup_experiments(variables,parameters,func,external):
                 *[f'{{{new_name}}}' for new_name in new_names],
                 **{fname:f'{{{fname}}}' for fname in field_names if fname !='' }
             )
-            known_keys = [fname for _, fname, _, _ in Formatter().parse(external)]
+            known_parameters = OrderedDict((fname,inspect._empty) for _, fname, _, _ in Formatter().parse(external))
             allow_all_keys = False
             default_parameters = {}
         else:
             func_parameters = inspect.signature(func).parameters
             default_parameters = {
-                key:value.default for i,(key,value) in enumerate(func_parameters.items()) 
+                key:value.default for key,value in func_parameters.items() 
                 if (value.default != inspect._empty)
             }
             allow_all_keys = any(value.kind ==4 for key,value in func_parameters.items())
-            known_keys = [
-                key for i,(key,value) in enumerate(func_parameters.items())
+            known_parameters = OrderedDict(
+                (key,value.default) for key,value in func_parameters.items()
                 if (value.kind not in [2,4])
-            ]
-        kwargs=default_parameters
-        free_keys=lambda : allow_all_keys or known_keys
-        required_keys=lambda : [key for key in known_keys if key not in kwargs]
-        is_allowed_key=lambda key: allow_all_keys or key in known_keys
+            )
+        kwargs=default_parameters.copy()
+        free_keys=lambda : allow_all_keys or known_parameters
+        required_keys=lambda : [key for key in known_parameters if key not in kwargs]
+        is_allowed_key=lambda key: allow_all_keys or key in known_parameters
         if variables:
             if not isinstance(variables,dict):
-                if known_keys:
-                    variables={known_keys[0]:variables}
+                non_default_parameters = [key for key in known_parameters if key not in default_parameters]
+                if len(non_default_parameters) == 1:
+                    variables={non_default_parameters[0]:variables}
+                elif len(known_parameters) ==1:
+                    variables = {list(known_parameters.keys())[0]:variables}
                 else:
                     raise ValueError(f'Must specify name for variable {variables}')
             if any(not is_allowed_key(key) or not is_identifier(key) for key in variables):
                 raise ValueError('Invalid variable names: {}'.format({key for key in variables if not is_allowed_key(key)}))
-            variables_update = {key:var(value) for key,value in variables.items()}
+            variables_update = {key:_var(value) for key,value in variables.items()}
         else:
             variables_update = {}
         if parameters:
@@ -550,12 +562,12 @@ def _setup_experiments(variables,parameters,func,external):
         if (((not parameters_passed and not class_instance) or (not variables_passed and allow_variables)) and free_keys()) or required_keys(): 
             while True:
                 prefill=', '.join([key+'=' for key in required_keys()])
-                parameters_string = input_with_prefill(STR_PARAMETERS_PROMPT(func,external,kwargs,known_keys,allow_variables,class_instance),prefill)
+                parameters_string = input_with_prefill(STR_PARAMETERS_PROMPT(func,external,kwargs,known_parameters,allow_variables,class_instance,allow_all_keys),prefill)
                 if parameters_string in ['?','help','--help','??']:
                     print(STR_PARAMETERS_HELP(allow_variables))
                     continue
                 try:
-                    update_kwargs = eval(f'(lambda **kwargs: kwargs)({parameters_string})',{'__builtins__':None},{'var':var} if allow_variables else {})#ast.literal_eval('{'+parameters_string+'}')
+                    update_kwargs = eval(f'(lambda **kwargs: kwargs)({parameters_string})',{'__builtins__':{'range':range}},{'var':_var} if allow_variables else {})#ast.literal_eval('{'+parameters_string+'}')
                 except Exception:#(ValueError,SyntaxError):
                     if '=help' in parameters_string:
                         print(STR_PARAMETERS_HELP(allow_variables))
@@ -564,32 +576,51 @@ def _setup_experiments(variables,parameters,func,external):
                 else:
                     kwargs.update({key: value for key,value in update_kwargs.items() if is_allowed_key(key)})
                     done = True
-                    if not all(key in kwargs for key in known_keys):
+                    if not all(key in kwargs for key in known_parameters):
                         if parameters_string =='':
                             print(STR_PARAMETERS_FORMAT)
                         done = False
                     if any(not is_allowed_key(key) for key in update_kwargs):
-                        print(STR_PARAMETERS_ALLOWED(update_kwargs,known_keys))
+                        print(STR_PARAMETERS_ALLOWED(update_kwargs,known_parameters))
                         done = False
                     if done:
                         break
-        return kwargs,external
+        return kwargs,external,default_parameters,known_parameters
     if external:
         def func(**kwargs):
             subprocess.check_call(external.format(**kwargs), stdout=sys.stdout, stderr=sys.stderr, shell=True)
+    classification_variables = variables.copy() if isinstance(variables,dict) else {}#can be None or a single unnamed iterable whose name will be found out only later 
+    classification_parameters = parameters.copy() if isinstance(parameters,dict) else {}# can be None
     if inspect.isclass(func):# in this case, parameters are for initialization and variables for function call
-        parameters,_ = _get_kwargs(func,False,None,parameters)
+        parameters,_,default_parameters,_ = _get_kwargs(func,False,None,parameters)
         func_initialized=func(**parameters)
-        variables,_ = _get_kwargs(func_initialized,False,variables,None,class_instance=True)
-        variables = {key:(value.obj if isinstance(value,var) else [value]) for key,value in variables.items()}
+        variables,_,default_parameters_2,known_parameters_2 = _get_kwargs(func_initialized,False,variables,None,class_instance=True)
+        real_variables = {key:value for key,value in variables.items() if isinstance(key,_var)}
+        classification_parameters.update({key:value for key,value in parameters.items() if key not in default_parameters or (key in default_parameters and value !=default_parameters[key])})
+        if len(variables)<=1:#nothing possibly interesting can be said if there is only one variable except if variable was not known (i.e. keyword argument) 
+            if not classification_parameters:#If not any classification yet take what you have
+                classification_variables.update({key:value for key,value in variables.items()})
+            else:
+                classification_variables.update({key:value for key,value in variables.items() if key not in known_parameters_2})
+        else:
+            classification_variables.update({key:value for key,value in variables.items() if key not in known_parameters_2 or (key in default_parameters_2 and value!=default_parameters_2[key])})
+            if any(key not in real_variables for key in variables if not key in default_parameters_2):#Not all nondefault parameters actually vary, so list those that do
+                classification_variables.update({key:value for key,value in real_variables.items() if key not in default_parameters_2})
+        variables = {key:(value.obj if isinstance(value,_var) else [value]) for key,value in variables.items()}
     else:
-        kwargs,external =_get_kwargs(func,external,variables,parameters)
-        variables = {key:value.obj for key,value  in kwargs.items() if isinstance(value,var)}
-        parameters ={key:value for key,value in kwargs.items() if not isinstance(value,var)}
+        kwargs,external,default_parameters,_ =_get_kwargs(func,external,variables,parameters)#use all as name, first params as usual (all hand selected, fill to 5), then __var_l_h
+        variables = {key:value.obj for key,value  in kwargs.items() if isinstance(value,_var)}
+        parameters ={key:value for key,value in kwargs.items() if not isinstance(value,_var)}
+        #use classification even if only one known parameter, this helps if the braces in a bash command string are changed and suddenly control something very different 
+        classification_parameters.update({key:value for key,value in parameters.items() if key not in default_parameters or (key in default_parameters and value!=default_parameters[key])})
+        classification_variables.update({key:value for key,value in variables.items() if key not in default_parameters or (key in default_parameters and value!=default_parameters[key])})
         def func_initialized(**experiment):
             return func(**experiment,**parameters)
     variables = list(variables.items())
-    return variables,parameters,func_initialized
+    classification_p = path_from_keywords(classification_parameters,into='file')
+    classification_v = '_'.join(s.replace('_','') for s in classification_variables.keys())
+    classification = classification_p+('+' if classification_v else '') +classification_v 
+    return variables,parameters,func_initialized,classification
 
 def _external(func):
     return func if isinstance(func,str) else False
@@ -756,13 +787,20 @@ def _try_store(what,serializer,file,_log,_err):
             _log.log(group=GRP_WARN, message=MSG_EXCEPTION_STORE(os.path.split(file)[-1]))
 
 def clean_git_repository(directory=None,dry_run = True):
+    '''
+    Delete all commits in repository specified by :code:`directory` which do not have matching
+    scilog entry in repository directory. 
+    :param directory: Path that is under version control
+    :type directory: String
+    :param dry_run: Actually go ahead and delete commits, else just list them
+    :type dry_run: Bool
+    '''
     directory = directory or os.getcwd()
     os.chdir(directory)
     scilog_tag = re.compile('scilog_.*')
     tags = [tag for tag in _git_command('tag --list',add_input = False).splitlines() if scilog_tag.match(tag)]
     git_directory = _git_command('rev-parse --show-toplevel', add_input=False).rstrip()
     os.chdir(git_directory)
-    dirs = [os.path.basename(x[0]) for x in os.walk(os.getcwd())]
     entries = load(need_unique=False,no_objects=True)
     IDs = [entry['ID'] for entry in entries]
     unmatched = [tag for tag in tags if tag[7:] not in IDs]
@@ -849,8 +887,8 @@ def load(search_pattern='*', path='', ID=None, no_objects=False, need_unique=Tru
         <name>/v0 <name>/v1 ... in the filesystem) and they should all be returned, 
         use `search_pattern=<name>/v*` and `need_unique=False`
     :type search_pattern: String, e.g. search_pattern='foo*' matches `foobar`
-    :param path: Path of exact location is known (possibly only partially), relative or absolute
-    :type path: String, e.g. '/home/work/2017/6/<name>' or 'work/2017/6'
+    :param path: Path of exact location if known (possibly only partially), relative or absolute
+    :type path: String, e.g. '/home/username/<project>' or '<project>'
     :param no_objects: To save time, only load information about scilog entry, not results
     :type no_objects: Boolean
     :param need_unique: Require unique identification of scilog entry.
@@ -934,7 +972,7 @@ def _max_mem(m, type):  # @ReservedAssignment
     else:  # Output of print_peak_memory
         return float(m)
 
-def _get_directory(name, path, no_date, debug, git, parameters):
+def _get_directory(name, path, no_date, debug, git, classification):
     if no_date:
         basepath = os.path.join(path, name)
     else:
@@ -949,11 +987,11 @@ def _get_directory(name, path, no_date, debug, git, parameters):
             pass
         os.makedirs(directory)
         return directory, FILE_DEBUG
-    try_parameter_based_directory= 0 if parameters else -1
+    try_classification_based_directory = 1 if classification else 0
     for attempt in range(20):  # Try keyword format, then random words, fail if cannot find unused
         ID = random_word(length = LEN_ID,dictionary = (attempt<10))
-        if try_parameter_based_directory>=0:
-            directory = os.path.join(basepath,path_from_keywords(parameters,into='file')+f'_{try_parameter_based_directory}')
+        if try_classification_based_directory:
+            directory = os.path.join(basepath,classification+f'_{try_classification_based_directory-1}')
         else:
             directory = os.path.join(basepath,ID)
         try:
@@ -964,11 +1002,11 @@ def _get_directory(name, path, no_date, debug, git, parameters):
                 return directory,ID
         except OSError as exc:
             if exc.errno == errno.EEXIST:
-                if try_parameter_based_directory>=0:
-                    try_parameter_based_directory += 1
+                if try_classification_based_directory:
+                    try_classification_based_directory  += 1
             else:
-                if try_parameter_based_directory>=0:#There was a problem creating a directory with the keyword format
-                    try_parameter_based_directory=-1#Maybe illegal characters in parameters, try it with random words
+                if try_classification_based_directory:#There was a problem creating a directory with the keyword format
+                    try_classification_based_directory = 0#Maybe illegal characters in parameters, try it with random words
                 else:#Already tried random words, something else is wrong
                     raise
     raise ValueError(MSG_ERROR_DIR)
@@ -1020,17 +1058,35 @@ def main():
     parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter,
         description=
         '''
-        Call FUNC and store results along with auxiliary information about
-        runtime and memory usage, installed modules, source code, hardware, etc.
+        Call FUNC once or multiple times and store results along with auxiliary information
+        about runtime and memory usage, installed modules, source code, hardware, etc.
         
-        FUNC is called once for each combination of variable values as 
-        specified by the variable ranges in VARIABLES.
         For example, FUNC can be a numerical algorithm and VARIABLES
-        can be used to specify different mesh resolutions via
-            -v "h=[2**(-l) for l in range(10)]" 
+        can be used to specify different mesh resolutions 
         with the goal to assess the rate of convergence.
-        Another example would be to specify a list of subroutines with the goal to find
-        the best subroutine in terms of runtime/memory consumption/....
+
+        FUNC is called once for each combination of variable values.
+        (a) If FUNC is a callable, variables can be specified by enclosing with `var(*)`
+            a Python expression that results in an iterable. 
+            For example, to call the function `foo` in module `bar` with all entries 
+            of `range(4)` in the first argument and `42` in the second, run:
+                $ scilog 'foo.bar(a=var(range(4)),b=42)'
+            (NOTE: FOR THE TIME BEING, THIS REQUIRES SPECIFICATION OF ARGUMENT NAMES!)
+            If `foo.bar` is provided without parentheses, the arguments will be asked 
+            for in an interactive command line interface.  
+        (b) If FUNC is a bash command string, placeholders can be specified by braces
+            and variable ranges specified with the command line argument VARIABLES. 
+            For example, try:
+                $ scilog 'echo {ARG}' --variables 'arg=range(4)'
+            specified by the variable ranges in VARIABLES.
+            If there are further parameters that don't have to be varied but should be 
+            recorded, they may be specified with PARAMETERS, e.g.:
+                $ scilog 'echo {ARG0}{ARG1}' --variables 'arg0=range(4)' --parameters 'arg1=42'
+        (c) If FUNC is a Python class definition, parameters for ininitialization of this class
+            can be specified with the command line argument PARAMETERS. The class is instantiated 
+            only once and all calls will be made to that instance. Variables for these calls can 
+            be specified with VARIABLES. Alternatively, both instance parameters and call variables
+            can be chosen in an interactive command line interface. 
 
         In the following, each call of FUNC is called an 'experiment'.
 
@@ -1072,48 +1128,40 @@ def main():
     parser.add_argument('func', action='store',
         help=textwrap.dedent(
         '''\
-        Function to be called
-        The standard way to specify FUNC is to provide the full path of a Python class or function definition,
-            e.g.: `foo.bar` where `foo` is a module in the Python search path and `bar` is a class or function in `foo`.
-        If `foo` contains a class or function of the same name, then specification of `foo` suffices. 
-        Alternatively, a bash command string may be provided,
-                e.g.: "echo 'Hello {}'".
-        In the standard case, the entries of INPUTS are passed to the specified class or function one after another.
-        If a class is specified, it is instantiated only once and the __call__ method of the instance is called.
-        In the alternative case, curly braces in the command string are replaced by the entries of INPUTS .
+        Function, bash command string, or class to perform experiments with.
         '''))
     parser.add_argument('-v', '--variables', action='store', default='None',
         help=textwrap.dedent(
         '''\
-        Dict of variable ranges or single variable range 
+        Dict of variable ranges or single variable range .
         Different syntax possibilities:
-             1) Single iterable expression, e.g.: "range(10)"
+             1) Single iterable expression, e.g.: "range(10)" (will be used for first argument of given function)
              2) Single or multiple kwargs-style expresions  "N=range(10),M=range(3)"
              3) Dictionary "{'N':range(10),'M':range(3)}"
         '''))
     parser.add_argument('-p', '--parameters', action='store', default='None',
         help=textwrap.dedent(
         '''\
-        Parameters that are equal for all experiments
+        Parameters that are equal for all experiments.
         Different syntax possibilities:
              1) kwarg-style, e.g.: "h=0.1,eps=0.01"
              2) dictionary-style: "{'h':0.1,'eps':0.01}".
         If argument FUNC is a function, PARAMETERS are passed
-        along the entries of INPUTS in form of keyword arguments to FUNC.
+        along the entries of VARIABLES in form of keyword arguments to FUNC.
         If argument FUNC specifies a class, the class is initialized
         with PARAMETERS as keyword arguments.
         If argument FUNC is a bash command string, PARAMETERS
-        are used to fill named braces after the intial empty braces, 
-            e.g.: if FUNC is "my_func {} -d {dir}" and PARAMETERS is "dir='/my/path'" 
-             and VARIABLES is "range(2)", then the following experiments will be run:
+        are used to fill braces not specified by VARIABLES. 
+        For example
+            $ scilog "my_func {} -d {dir}" --variables range(2) --parameters "dir='/my/path'" 
+        results in the following commands to be executed:
                  1) my_func 0 -d /my/path
                  2) my_func 1 -d /my/path.
-            ('/my/path' can be replaced by any Python expression (which will then be converted to a string))
         '''))
     parser.add_argument('-n', '--name', action='store', default=None,
         help=textwrap.dedent(
         '''\
-        Name of the scilog entry
+        Name of the scilog entry.
         If not provided, name is derived from FUNC.
         '''))
     parser.add_argument('-a', '--analyze', action='store',
@@ -1123,14 +1171,14 @@ def main():
         Function that is used to perform analysis after each experiment.
         By default, ANALYZE is assumed to be the name of a function in the same module as FUNC.
         Alternatively, ANALYZE can be
-            1) a full name of a function in some different module,
+            1) the full path of a Python function in some different module,
                 e.g.: foo2.analyze
-            2) a name of a method of the class specified by FUNC.
+            2) the name of a method of the class specified by FUNC.
         '''))
     parser.add_argument('-d', '--directory', action='store', default=None,
         help=textwrap.dedent(
         '''\
-        Specify where scilog entry should be stored.
+        Scilog base directory.
         '''))
     parser.add_argument('--parallel', action='store_true',
         help=textwrap.dedent(
@@ -1152,9 +1200,12 @@ def main():
         help=textwrap.dedent(
         '''\
         Create git snapshot commit.
-        The resulting commit is tagged with the entry ID and resides outside
-        the branch history.
-        Add 'scilog' to your .gitignore to avoid storing the scilog entries in each snapshot .
+        The repository path may be specified, else it will be automatically detected
+        The resulting commit is tagged with the entry ID and resides outside the branch history.
+        Add 'scilog' to your .gitignore to avoid storing the scilog entries in each snapshot.  
+        (Should you ever want get rid of the snapshots, 
+        use `git tag --list 'scilog_*'|xargs -I %% git tag -d %%` to remove all scilog commits or 
+        use function `clean_git_repository` to remove all scilog commits whose scilog entry does not reside in repository anymore)
         '''))
     parser.add_argument('--no_date', action='store_true',
         help=textwrap.dedent(
@@ -1187,7 +1238,7 @@ def main():
         default=None,
         help=textwrap.dedent(
         '''\
-        Specify directory where FUNC stores its output.
+        Directory where FUNC stores its output.
         If flag is not specified, FUNC will be run in a clean working directory
         and it is assumed that its outputs are stored in that working directory.
         If flag is specified without path, current working directory is used.
@@ -1205,16 +1256,24 @@ def main():
                 subprocess.call(['gitdiffuntracked', entry[0]['gitcommit']])
     else:
         try:
-            variables = eval(f'(lambda **kwargs: kwargs)({args.variables})',{'__builtins__':None},{})
+            variables = eval(f'(lambda **kwargs: kwargs)({args.variables})',{'__builtins__':{'range':range}},{})
         except Exception:   
             variables = eval(args.variables)
         try:
-            parameters = eval(f'(lambda **kwargs: kwargs)({args.parameters})',{'__builtins__':None},{})
+            parameters = eval(f'(lambda **kwargs: kwargs)({args.parameters})',{'__builtins__':{'range':range}},{})
         except Exception:
             parameters = eval(args.parameters)
-        python_function_s = re.compile('(\w+\.)+(\w+)')
-        external = args.external or not python_function_s.match(args.func)
+        python_function_s = re.compile('(\w+\.)+(\w+)(\(.*\))?\s*$')#re.compile('(\w+\.)+(\w+)(\(*\))?')
+        python_function_match = python_function_s.match(args.func)
+        external = args.external or not python_function_match 
         if not external:#Assume args.func describes a Python class or function
+            if python_function_match.group(3):
+                if parameters is not None or variables is not None:
+                    raise ValueError('Parameters or variables specified more than once')
+                args.func = args.func.split('(')[0]
+                vars_and_pars = eval(f'(lambda **kwargs: kwargs){python_function_match.group(3)}',{'__builtins__':{'range':range}},{'var':_var})
+                variables = {key:value.obj for key,value  in vars_and_pars.items() if isinstance(value,_var)}
+                parameters ={key:value for key,value in vars_and_pars.items() if not isinstance(value,_var)}
             try:#Assume that args.func is a module path containing class or function of same name
                 module = importlib.import_module(args.func)
             except ImportError:#Assume that args.func is module path plus trailing function or class name
