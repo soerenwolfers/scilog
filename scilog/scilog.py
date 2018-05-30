@@ -138,7 +138,7 @@ STR_PARAMETERS_HELP = lambda allow_variables: (
                         )
 STR_GITDIFF = '\n The current working directory differs from the git repository at the time of the scilog entry as follows:'
 STR_ENTRY = lambda entry: ('=' * 80+'\nEntry \'{}\' at {}:\n'.format(entry['name'], entry['path'])
-            + '=' * 80 + '\n' + json.dumps(entry, sort_keys=True, indent=4, default=str)[1:-1])
+            + '=' * 80 + '\n' + json.dumps({key:value for key,value in entry.items() if key != 'modules'}, sort_keys=True, indent=4, default=str)[1:-1])
 STR_MULTI_ENTRIES = lambda n:f'Found {n} entries'
 MSG_DEBUG =  'Running in debug mode. Entry is not stored permanently, stdout and stderr are not captured, no git commit is created'
 MSG_START_ANALYSIS = 'Updating analysis'
@@ -147,7 +147,7 @@ MSG_START_EXPERIMENT = lambda i,n,inp: (f'Running experiment {i+1}/{n}' +
           if inp != {} else ''))
 MSG_START_GIT = lambda repo:'Creating snapshot of current working tree of repository \'{}\'. Check {}'.format(repo,FILE_GITLOG)
 def MSG_START_EXPERIMENTS(name,variables,parameters):
-    msg = f'Will call {name}'
+    msg = f'Will call `{name}`'
     extend=''
     new_line=False
     if parameters:
@@ -158,7 +158,7 @@ def MSG_START_EXPERIMENTS(name,variables,parameters):
         variable_strings = [(variable[0],str(variable[1])) for variable in variables]
         newline_in_vs = any('\n' in vs[1] for vs in variable_strings)
         sep = '\n\t' if (len(variables)>1 or newline_in_vs) else ', '
-        strings = [('' if sep == ', ' else  '-') +"'"+vs[0] + ("' varying in `" +vs[1]+"`" if not newline_in_vs else '') for vs in variable_strings]
+        strings = [('' if sep == ', ' else  '-') +f'`{vs[0]}`'+ (f' varying in `{vs[1]}`' if not newline_in_vs else '') for vs in variable_strings]
         extend += (" \n" if new_line else " ") +(f'and {s_var}' if extend else f' with {s_var}')+(' ' if sep==', ' else sep)+sep.join(strings)
     if not extend:
         extend =' once'
@@ -193,6 +193,7 @@ MSG_WARN_DILL = ('Could not find dill. Some items might not be storable. '
 MSG_INTERRUPT = f'Kill signal received. Stored {FILE_INFO}, closing now.'
 LEN_ID = 8
 
+#TODO think about using inspect.formatargspec(inspect.getargspec(func)) to directly parse args and kwargs of user input even without named argument
 def record(func, variables=None, name=None, directory=None, aux_data=None,
             analysis=None, runtime_profile=False, memory_profile=False,
             git=False, no_date=False, parallel=False,
@@ -321,21 +322,24 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
     _log.log(MSG_START_ENTRY(directory))
     if debug:
         _log.log(group =GRP_WARN,message = MSG_DEBUG)
-    info = dict()
-    info['parameters'] = {key:repr(parameters[key]) for key in parameters}
-    info['variables'] = [repr(variable) for variable in variables]
-    info['name'] = name
-    info['ID'] = ID
-    info['time'] = datetime.datetime.now().strftime(STR_TIME)
-    info['func'] = external or repr(func)
-    info['parallel'] = parallel
-    info['hardware'] = sys_info.hardware()
-    info['experiments'] = {
-        'runtime':[None] * n_experiments, 
-        'memory':[None] * n_experiments, 
-        'output':[None] * n_experiments, 
-        'status':['queued'] * n_experiments,
-        'input':[str(input) for input in inputs]
+    info = {
+        'parameters' : {key:repr(parameters[key]) for key in parameters},
+        'variables' : [repr(variable) for variable in variables],
+        'name' : name,
+        'ID' : ID,
+        'time' : datetime.datetime.now().strftime(STR_TIME),
+        'func' : external or repr(func),
+        'parallel' : parallel,
+        'hardware' : sys_info.hardware(),
+        'gitcommit' : None,
+        'modules' : None,
+        'experiments' : {
+            'runtime':[None] * n_experiments, 
+            'memory':[None] * n_experiments, 
+            'output':[None] * n_experiments, 
+            'status':['queued'] * n_experiments,
+            'input':[str(input) for input in inputs]
+        }
     }
     if not external:
         info['modules'] = sys_info.modules()
@@ -345,8 +349,6 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
         except Exception:  # TypeError only?
             _err.log(traceback.format_exc())
             _log.log(group=GRP_WARN, message=MSG_WARN_SOURCE)
-    else:
-        info['modules'] = None
     if memory_profile is not False:
         if memory_profile == 'detail':
             try:
@@ -377,8 +379,6 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
             _err.log(message=str(e)+'\n'+c.stderr)
             append_text(git_file, e.git_log)
             raise
-    else:
-        info['gitcommit'] = None
     try:
         import dill
         serializer = dill
@@ -519,6 +519,8 @@ def _setup_experiments(variables,parameters,func,external):
                 **{fname:f'{{{fname}}}' for fname in field_names if fname !='' }
             )
             known_parameters = OrderedDict((fname,inspect._empty) for _, fname, _, _ in Formatter().parse(external))
+            if len(known_parameters)==1 and list(known_parameters.keys())[0] == None:
+                known_parameters = []
             allow_all_keys = False
             default_parameters = {}
         else:
@@ -905,11 +907,11 @@ def load(search_pattern='*', path='', ID=None, no_objects=False, need_unique=Tru
         deserializer = dill
     except ImportError:
         warnings.warn(MSG_WARN_DILL)
-    entries = []
     if os.sep in search_pattern and path == '':
         temp_path, temp_search_pattern = search_pattern.rsplit(os.sep, 1)
         if os.path.isabs(temp_path):
             path, search_pattern = temp_path, temp_search_pattern
+    entries = []
     entries.extend(find_directories(search_pattern, path=path))
     entries.extend(find_directories('*/' + search_pattern, path=path))
     entries = [entry for entry in entries if _is_experiment_directory(entry)]
@@ -1130,7 +1132,7 @@ def main():
         '''\
         Function, bash command string, or class to perform experiments with.
         '''))
-    parser.add_argument('-v', '--variables', action='store', default='None',
+    parser.add_argument('-v', '--variables', action='store', default='',
         help=textwrap.dedent(
         '''\
         Dict of variable ranges or single variable range .
@@ -1139,7 +1141,7 @@ def main():
              2) Single or multiple kwargs-style expresions  "N=range(10),M=range(3)"
              3) Dictionary "{'N':range(10),'M':range(3)}"
         '''))
-    parser.add_argument('-p', '--parameters', action='store', default='None',
+    parser.add_argument('-p', '--parameters', action='store', default='',
         help=textwrap.dedent(
         '''\
         Parameters that are equal for all experiments.
@@ -1239,7 +1241,7 @@ def main():
         help=textwrap.dedent(
         '''\
         Directory where FUNC stores its output.
-        If flag is not specified, FUNC will be run in a clean working directory
+        If not specified, FUNC will be run in a clean working directory
         and it is assumed that its outputs are stored in that working directory.
         If flag is specified without path, current working directory is used.
         '''))
@@ -1251,30 +1253,45 @@ def main():
             print(STR_MULTI_ENTRIES(len(entries)))
         for entry in entries:
             print(STR_ENTRY(entry))
-            if args.git:
+            if args.git and entry['gitcommit']:
                 print(STR_GITDIFF)
-                subprocess.call(['gitdiffuntracked', entry[0]['gitcommit']])
+                try:
+                    subprocess.call(['gitdiffuntracked', entry['gitcommit']])
+                except subprocess.CalledProcessError:
+                    pass
     else:
+        v_args = False
         try:
-            variables = eval(f'(lambda **kwargs: kwargs)({args.variables})',{'__builtins__':{'range':range}},{})
-        except Exception:   
+            v_args,variables = eval(f'(lambda *args,**kwargs: (args,kwargs))({args.variables})',{'__builtins__':{'range':range}},{})
+        except Exception as e: 
             variables = eval(args.variables)
+        if v_args:
+            raise ValueError('All variables must be named')
+        p_args = False
         try:
-            parameters = eval(f'(lambda **kwargs: kwargs)({args.parameters})',{'__builtins__':{'range':range}},{})
+            p_args,parameters = eval(f'(lambda *args,**kwargs: (args,kwargs))({args.parameters})',{'__builtins__':{'range':range}},{})
         except Exception:
             parameters = eval(args.parameters)
-        python_function_s = re.compile('(\w+\.)+(\w+)(\(.*\))?\s*$')#re.compile('(\w+\.)+(\w+)(\(*\))?')
+        if p_args:
+            raise ValueError('All parameters must be named')
+        python_function_s = re.compile('\s*(\w+\.)+(\w+)(\(.*\))?\s*$')#re.compile('(\w+\.)+(\w+)(\(*\))?')
         python_function_match = python_function_s.match(args.func)
         external = args.external or not python_function_match 
         if not external:#Assume args.func describes a Python class or function
+            not_module = False #Do not treat args.func as if it was only a module without callable name
             if python_function_match.group(3):
-                if parameters is not None or variables is not None:
+                not_module = True
+                if args.parameters or args.variables:
                     raise ValueError('Parameters or variables specified more than once')
                 args.func = args.func.split('(')[0]
-                vars_and_pars = eval(f'(lambda **kwargs: kwargs){python_function_match.group(3)}',{'__builtins__':{'range':range}},{'var':_var})
+                vp_args,vars_and_pars = eval(f'(lambda *args,**kwargs: (args,kwargs)){python_function_match.group(3)}',{'__builtins__':{'range':range}},{'var':_var})
+                if vp_args:
+                    raise ValueError('All arguments to Python function must be named')
                 variables = {key:value.obj for key,value  in vars_and_pars.items() if isinstance(value,_var)}
                 parameters ={key:value for key,value in vars_and_pars.items() if not isinstance(value,_var)}
             try:#Assume that args.func is a module path containing class or function of same name
+                if not_module:#Skip to below
+                    raise ImportError
                 module = importlib.import_module(args.func)
             except ImportError:#Assume that args.func is module path plus trailing function or class name
                 module_name = '.'.join(args.func.split('.')[:-1])
@@ -1287,8 +1304,12 @@ def main():
                 try:
                     func = getattr(module, class_or_function_name2)
                 except AttributeError:
-                    raise ValueError(f'{class_or_function_name} is not a callable or class in module {module.__name__}') from None
+                    raise ValueError(f'`{class_or_function_name}` is not a callable or class in module `{module.__name__}` at {module.__file__}') from None
         else:#Assume the module describes an external call
+            python_incomplete_function_s = re.compile('\s*(\w+)\(.*\)\s*$')#TODO:warn about externals that look like python calls with forgotten module
+            python_incomplete_function_match =  python_incomplete_function_s.match(args.func)
+            if python_incomplete_function_match:
+                raise ValueError(f'Did you forget to specify a module for Python function `{python_incomplete_function_match.group(1)}`?')
             func = args.func
         if args.analyze:
             try:
