@@ -3,20 +3,21 @@ scilog: Digital bookkeeping of numerical experiments for reproducible science
 :Author: Soeren Wolfers <soeren.wolfers@gmail.com>
 :Organization: King Abdullah University of Science and Technology (KAUST) 
 
-This package provides a command line tool to save information about source code, hardware, installed packages, runtime, memory usage along with the actual results of numerical experiments.
+This package provides a command line tool to execute numerical experiments and store results along with auxiliary information about inputs, source code, hardware, installed packages, runtime, memory usage.
 
-In its easiest form, :code:`scilog 'my_program'`, runs `my_program` and stores output, runtime, and system information in the directory`scilog/my_program`. 
-(Don't worry. Running the same command again, creates subfolders `scilog/my_program/v0` and `scilog/my_program/v1`. Nothing ever gets overwritten.)
-If the flag `--git` is used, `scilog` additionally creates a snapshot commit of the current working tree in the git branch `_scilog` of the containing git repository.
+In its easiest form, :code:`scilog 'foo.bar(x=1,y=2)'`, runs the function Python function `bar` in the module `foo` and stores output, input, runtime, system, and source code information. 
 
-Using :code:`scilog 'my_program {}' -e range(4)`, the program is run with the inputs [0,1,2,3]. Here, `range(4)` can be replaced by any valid Python code that creates an iterable of experiment configurations.
+If the flag `--git` is used, `scilog` additionally creates a snapshot commit of the current working tree that resides outside the actual branch history.
+
+Since most computational research requires series of experiments, :code:`scilog` supports such series through the specification of *variable ranges*. 
+Using :code:`scilog 'foo.bar(x=var(1,2),y=2)'` does the same as above, but foo.bar is run once with `x=1` and once with `x=2`.
  
-For numerical experiments with Python, one can use the simple syntax `scilog my_package.my_module.my_function` instead of
-`scilog 'python -m my_package.my_module.my_function'`. The flags `--memory_profile` and `--runtime_profile` can then be used store additional detailed runtime and memory usage information.
+Scilog can also be used for numerical experiments that are not based on Python. Using :code:`scilog 'my_tool {p}' --variables p=[0,1]` the 
+command line tool :code:`my_tool` is run twice, with inputs `1` and `2`, respectively. 
 
-Information on previous scilog entries can be displayed using `scilog --show 'my_program'`
+Information on previous scilog entries can be displayed using `scilog --show 'my_tool'` or by simple navigating scilog's directory hierarchy, where 
+all entries are stored in binary form and as much as possible easily accessible text form. 
 
-scilog can also be called within python, using the functions `scilog.conduct` and `scilog.load`.
 ---
 
 To install run :code:`pip install scilog`
