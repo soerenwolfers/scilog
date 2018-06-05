@@ -14,8 +14,10 @@ import gc
 import inspect
 import importlib
 import re
+import pathlib
 import types
 import subprocess
+import pty
 import shlex
 import json
 import contextlib
@@ -33,7 +35,7 @@ from matplotlib import pyplot
 from IPython.utils.capture import capture_output
 
 from swutil import sys_info, np_tools, plots, aux
-from swutil.validation import Positive, Integer
+from swutil.validation import Positive, Integer, String
 from swutil.logs import Log
 from swutil.hpc import Locker
 from swutil.aux import  string_dialog, no_context, random_word,\
@@ -124,7 +126,7 @@ def STR_PARAMETERS_ALLOWED(passed_keys,known_parameters):
     else:
         out = '!! Cannot specify parameter '+f'`{forbidden[0]}`'
     return out
-STR_PARAMETERS_FORMAT = '!! Input must have form `<key>=<value>[,<key>=<value>]*` -- Enter `help` for more information'
+STR_PARAMETERS_FORMAT = '!! Input must have form `<key>=<value>[,<key>=<value>]*`\n!! Enter `help` for more information'
 STR_PARAMETERS_HELP = lambda allow_variables: (
                             '?? Parameters are specified by `<key>=<value>` with <key> a Python identifier and <value> a Python expression.'
                             +(
@@ -146,6 +148,8 @@ MSG_START_EXPERIMENT = lambda i,n,inp: (f'Running experiment {i+1}/{n}' +
         (' with variable values {}{}'.format('\n\t' if '\n' in repr(inp) else '',repr(inp))
           if inp != {} else ''))
 MSG_START_GIT = lambda repo:'Creating snapshot of current working tree of repository \'{}\'. Check {}'.format(repo,FILE_GITLOG)
+MSG_ENTER_SCREEN = lambda session_name: f'Entering screen session {session_name}'
+MSG_START_SCREEN = 'To detach from session, press `Ctrl+a`, then `d`'
 def MSG_START_EXPERIMENTS(name,variables,parameters):
     msg = f'Will call `{name}`'
     extend=''
@@ -293,22 +297,19 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
     '''
     ########################### FIX ARGUMENTS ###########################
     name = name or _get_name(func)
-    external = _external(func) or False
+    external = _external(func)
     debug = debug if debug is not None else aux.isdebugging()
     if debug: 
         git = False
     if git is True:
-        if external:
-            git = os.getcwd()
-        else:
-            git = os.path.dirname(sys.modules[func.__module__].__file__)
-    variables,parameters,func_initialized,classification = _setup_experiments(variables,parameters,func,external)
+        if not String.valid(git):
+            git = _get_func_directory(func) #Can't use base_directory, because user specified directory shouldn't be used for git
+    variables,parameters,func_initialized,classification = _setup_experiments(variables,parameters,func)
     t = itertools.product(*[variable[1] for variable in variables])
     inputs = [{variable[0]:tt[i] for i,variable in enumerate(variables)} for tt in t]
     n_experiments = len(inputs)
     ########################### CREATE SCILOG ENTRY ###########################
-    base_directory = directory or (os.getcwd() if external else os.path.join(os.path.dirname(sys.modules[func.__module__].__file__),'scilog'))
-    directory,ID = _get_directory(name, base_directory, no_date, debug,git,classification)
+    directory,ID = _get_directory(directory,func,name,no_date,debug,git,classification)
     log_file = os.path.join(directory, FILE_LOG)
     err_file = os.path.join(directory, FILE_ERR)
     info_file = os.path.join(directory, FILE_INFO)
@@ -468,6 +469,23 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
              else MSG_FINISH_ENTRY_FAIL)
     return directory
 
+
+def _external(func):
+    return func if isinstance(func,str) else False
+
+def _get_func_directory(func):
+    return os.getcwd() if _external(func) else os.path.dirname(sys.modules[func.__module__].__file__) 
+
+def _get_base_directory(directory,func,name,no_date):
+    directory = directory or _get_func_directory(func)
+    directory = os.path.join(directory,'scilog')
+    if no_date:
+        basepath = os.path.join(directory, name)
+    else:
+        date = datetime.date.today()
+        basepath = os.path.join(directory, date.strftime('w%Wy%y'), name)
+    return os.path.abspath(basepath)
+
 def _get_name(func):
     if _external(func): 
         oneword = re.compile('\w+')
@@ -489,7 +507,8 @@ class _var:
             raise ValueError()
     def __repr__(self):
         return 'var('+repr(self.obj)+')'
-def _setup_experiments(variables,parameters,func,external):
+def _setup_experiments(variables,parameters,func):
+    external = _external(func)
     def _get_kwargs(func,external,variables,parameters,class_instance=False):
         if inspect.isclass(func):
             allow_variables =False
@@ -535,7 +554,7 @@ def _setup_experiments(variables,parameters,func,external):
                 if (value.kind not in [2,4])
             )
         kwargs=default_parameters.copy()
-        free_keys=lambda : allow_all_keys or known_parameters
+        free_keys=lambda : allow_all_keys or any(key not in variables and key not in parameters for key in known_parameters)
         required_keys=lambda : [key for key in known_parameters if key not in kwargs]
         is_allowed_key=lambda key: allow_all_keys or key in known_parameters
         if variables:
@@ -623,9 +642,6 @@ def _setup_experiments(variables,parameters,func,external):
     classification_v = '_'.join(s.replace('_','') for s in classification_variables.keys())
     classification = classification_p+('+' if classification_v else '') +classification_v 
     return variables,parameters,func_initialized,classification
-
-def _external(func):
-    return func if isinstance(func,str) else False
 
 def _run_single_experiment(arg):
     (i, input, directory, func, memory_profile,
@@ -876,11 +892,10 @@ def analyze(entry,func, _log=None, _err=None, debug=False):
             shutil.rmtree(os.path.split(analysis_directory_tmp)[0], ignore_errors=True)
     except Exception:
         os.chdir(cwd)
-        
-def _keyword_match(template, test):
-    return all(key in test and re.search(template[key],test[key]) for key in template)
-              
-def load(search_pattern='*', path='', ID=None, no_objects=False, need_unique=True,parameters = None):
+class RE:
+    def __init__(self,s):
+        self.s=s
+def load(search_pattern='*', path='', ID=None, no_objects=False, need_unique=True,parameters=None):
     '''
     Load scilog entry/entries.
    
@@ -907,10 +922,12 @@ def load(search_pattern='*', path='', ID=None, no_objects=False, need_unique=Tru
         deserializer = dill
     except ImportError:
         warnings.warn(MSG_WARN_DILL)
-    if os.sep in search_pattern and path == '':
+    if os.sep in search_pattern and path == '':#Use absolute path part of search pattern as path, if existent
         temp_path, temp_search_pattern = search_pattern.rsplit(os.sep, 1)
         if os.path.isabs(temp_path):
             path, search_pattern = temp_path, temp_search_pattern
+    if search_pattern[-1]!='*':
+        search_pattern = search_pattern+'*'
     entries = []
     entries.extend(find_directories(search_pattern, path=path))
     entries.extend(find_directories('*/' + search_pattern, path=path))
@@ -946,10 +963,30 @@ def load(search_pattern='*', path='', ID=None, no_objects=False, need_unique=Tru
         return info
     if ID:
         partial_id = re.compile(ID)
-        entries = filter(lambda entry: partial_id.match(get_output(entry, no_objects = True)['ID']),entries)
+        entries = [entry for entry in entries if partial_id.match(get_output(entry, no_objects = True)['ID'])]
     if parameters:
-        parameters = {key:repr(value) for (key,value) in parameters}
-        entries = filter(lambda entry: _keyword_match(parameters,get_output(entry,no_objects = True)['parameters']),entries)
+        parameters = {key:(repr(value) if not isinstance(value,RE) else value) for (key,value) in parameters.items()}
+        def matches_parameters(entry):
+            out = get_output(entry,no_objects=True)
+            if not 'parameters' in out:
+                return False
+            else:
+                test = out['parameters']
+                for key,value in parameters.items():
+                    if key not in test:
+                        return False
+                    if isinstance(value,RE):
+                        if not re.match(value.s,test[key]):
+                            return False
+                    else:
+                        if not value == test[key]:
+                            return False 
+                return True
+        entries = [entry for entry in entries if matches_parameters(entry)]
+    if len(entries)>1 and need_unique:
+        basenames = [os.path.basename(get_output(entry,no_objects=True)['path']).rsplit('_',1) for entry in entries]
+        if len(set(bn[0] for bn in basenames))==1:
+            entries = [max(entries,key = lambda entry: get_output(entry,no_objects=True)['time'])]
     entries = unique(entries)
     if not need_unique:
         return (get_output(entry, no_objects=no_objects) for entry in entries)
@@ -973,14 +1010,9 @@ def _max_mem(m, type):  # @ReservedAssignment
         return max(values) - min(values)
     else:  # Output of print_peak_memory
         return float(m)
-
-def _get_directory(name, path, no_date, debug, git, classification):
-    if no_date:
-        basepath = os.path.join(path, name)
-    else:
-        date = datetime.date.today()
-        basepath = os.path.join(path, date.strftime('w%Wy%y'), name)
-    basepath = os.path.abspath(basepath)
+    
+def _get_directory(directory,func,name,no_date, debug, git, classification):
+    basepath = _get_base_directory(directory,func,name,no_date)
     if debug:
         directory = os.path.join(basepath, FILE_DEBUG)
         try:
@@ -1054,7 +1086,22 @@ def _git_snapshot(path, commit_body, ID):
         raise GitError(traceback.format_exc(), out)
     os.chdir(initial_directory)
     return snap_id, out, git_directory
-
+def _patch_screenrc():
+    '''
+    Prevent ending a screen session with Ctrl-D unless user has an opinion about that
+    '''
+    screenrc_path=os.path.join(str(pathlib.Path.home()),'.screenrc')
+    try:
+        with open(screenrc_path,'r') as fp:
+            screenrc = fp.readlines()
+    except FileNotFoundError:
+        screenrc=[]
+    for line in screenrc:
+        if 'setenv IGNOREEOF' in line:
+            break
+    else:
+        with open(screenrc_path,'a+') as fp:
+            fp.write('setenv IGNOREEOF 5\n')
 def main():
     import textwrap
     parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter,
@@ -1132,22 +1179,20 @@ def main():
         '''\
         Function, bash command string, or class to perform experiments with.
         '''))
-    parser.add_argument('-v', '--variables', action='store', default='',
+    parser.add_argument('-v', '--variables', action='store', default=None,
         help=textwrap.dedent(
         '''\
-        Dict of variable ranges or single variable range .
-        Different syntax possibilities:
-             1) Single iterable expression, e.g.: "range(10)" (will be used for first argument of given function)
-             2) Single or multiple kwargs-style expresions  "N=range(10),M=range(3)"
-             3) Dictionary "{'N':range(10),'M':range(3)}"
+        Name value pair of variables and their range.
+        Use Python keyword argument style.
+        For example, "--variables N=range(10),M=[1.2,4.3]" 
+        will result in 20=10*2 experiments.  
+
         '''))
-    parser.add_argument('-p', '--parameters', action='store', default='',
+    parser.add_argument('-p', '--parameters', action='store', default=None,
         help=textwrap.dedent(
         '''\
         Parameters that are equal for all experiments.
-        Different syntax possibilities:
-             1) kwarg-style, e.g.: "h=0.1,eps=0.01"
-             2) dictionary-style: "{'h':0.1,'eps':0.01}".
+        Use Python keyword argument style, e.g.: "h=0.1,eps=0.01"
         If argument FUNC is a function, PARAMETERS are passed
         along the entries of VARIABLES in form of keyword arguments to FUNC.
         If argument FUNC specifies a class, the class is initialized
@@ -1245,6 +1290,13 @@ def main():
         and it is assumed that its outputs are stored in that working directory.
         If flag is specified without path, current working directory is used.
         '''))
+    parser.add_argument('--noscreen',action='store_true',
+        help=textwrap.dedent(
+        '''\
+        Use if `screen` is not available or is broken. 
+        '''
+        ))
+    #parser.add_argument('--holdon',action='store_true',help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.show:
         entries = load(search_pattern=args.func, no_objects=True, need_unique=False)
@@ -1260,20 +1312,14 @@ def main():
                 except subprocess.CalledProcessError:
                     pass
     else:
-        v_args = False
-        try:
-            v_args,variables = eval(f'(lambda *args,**kwargs: (args,kwargs))({args.variables})',{'__builtins__':{'range':range}},{})
-        except Exception as e: 
-            variables = eval(args.variables)
-        if v_args:
-            raise ValueError('All variables must be named')
-        p_args = False
-        try:
-            p_args,parameters = eval(f'(lambda *args,**kwargs: (args,kwargs))({args.parameters})',{'__builtins__':{'range':range}},{})
-        except Exception:
-            parameters = eval(args.parameters)
-        if p_args:
-            raise ValueError('All parameters must be named')
+        if args.variables is None:
+            variables = None
+        else:
+            variables = eval(f'(lambda **kwargs: kwargs)({args.variables})',{'__builtins__':{'range':range}},{})
+        if args.parameters is None:
+            parameters = None
+        else:
+            parameters = eval(f'(lambda **kwargs: kwargs)({args.parameters})',{'__builtins__':{'range':range}},{})
         python_function_s = re.compile('\s*(\w+\.)+(\w+)(\(.*\))?\s*$')#re.compile('(\w+\.)+(\w+)(\(*\))?')
         python_function_match = python_function_s.match(args.func)
         external = args.external or not python_function_match 
@@ -1286,7 +1332,7 @@ def main():
                 args.func = args.func.split('(')[0]
                 vp_args,vars_and_pars = eval(f'(lambda *args,**kwargs: (args,kwargs)){python_function_match.group(3)}',{'__builtins__':{'range':range}},{'var':_var})
                 if vp_args:
-                    raise ValueError('All arguments to Python function must be named')
+                    raise ValueError('All arguments to Python function must be named (omit parentheses in scilog call for interactive argument specification)')
                 variables = {key:value.obj for key,value  in vars_and_pars.items() if isinstance(value,_var)}
                 parameters ={key:value for key,value in vars_and_pars.items() if not isinstance(value,_var)}
             try:#Assume that args.func is a module path containing class or function of same name
@@ -1328,20 +1374,50 @@ def main():
                 warnings.warn(MSG_ERROR_LOAD('function {}'.format(args.analyze)))
         else:
             analyze_fn = None
-        record(
-            func=func, 
-            directory=args.directory,
-            variables=variables,
-            name=args.name,
-            analysis=analyze_fn,
-            runtime_profile=args.runtime_profile,
-            memory_profile=args.memory_profile,
-            git=args.git,
-            no_date=args.no_date,
-            parallel=args.parallel,
-            copy_output=args.copy,
-            debug = args.debug,
-            parameters=parameters
-        )
+        if not args.noscreen:
+            try:
+                _patch_screenrc()
+            except Exception:
+                pass 
+            variables,parameters,_,classification = _setup_experiments(variables,parameters,func)
+            session_name = (args.name or _get_name(func))+'.'+classification
+            #(_,slave)=pty.openpty()
+            remaining_argv = []
+            i=-1
+            while True:
+                i+=1
+                if i>=len(sys.argv):
+                    break
+                if sys.argv[i] in ['--parameters','--variables','-p','-v']:
+                    i+=1#also skip arguments
+                    continue
+                remaining_argv.append(sys.argv[i])
+            argumenter = lambda d: ', '.join(f'{key}={repr(value)}' for key,value in d.items())
+            remaining_argv.extend(['--variables',argumenter(dict(variables)),'--parameters',argumenter(parameters),'--noscreen'])#abuse noscreen flag for inner scilog session
+            #print(['screen','-dmS', session_name,*remaining_argv])
+            print(MSG_ENTER_SCREEN(session_name))
+            subprocess.run(['screen','-S', session_name,*remaining_argv])
+        else:
+            try:
+                if args.noscreen:#abuse noscreen flag to recognize inner scilog session
+                    print(MSG_START_SCREEN)
+                record(
+                    func=func, 
+                    directory=args.directory,
+                    variables=variables,
+                    name=args.name,
+                    analysis=analyze_fn,
+                    runtime_profile=args.runtime_profile,
+                    memory_profile=args.memory_profile,
+                    git=args.git,
+                    no_date=args.no_date,
+                    parallel=args.parallel,
+                    copy_output=args.copy,
+                    debug = args.debug,
+                    parameters=parameters
+                )
+            except:#this try-except is needed in particular within screen: screen session terminates as soon as the inner scilog run ends, so the inner scilog sesssion must not end
+                traceback.print_exc()
+            input('Press Enter to exit')
 if __name__ == '__main__':
     main()
