@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import timeit
 import pickle
 import os
@@ -17,12 +16,10 @@ import re
 import pathlib
 import types
 import subprocess
-import pty
 import shlex
 import json
 import contextlib
 import stat
-import argparse
 import itertools
 import ast
 import builtins
@@ -138,18 +135,12 @@ STR_PARAMETERS_HELP = lambda allow_variables: (
                                 ) if allow_variables else ''
                             )
                         )
-STR_GITDIFF = '\n The current working directory differs from the git repository at the time of the scilog entry as follows:'
-STR_ENTRY = lambda entry: ('=' * 80+'\nEntry \'{}\' at {}:\n'.format(entry['name'], entry['path'])
-            + '=' * 80 + '\n' + json.dumps({key:value for key,value in entry.items() if key != 'modules'}, sort_keys=True, indent=4, default=str)[1:-1])
-STR_MULTI_ENTRIES = lambda n:f'Found {n} entries'
 MSG_DEBUG =  'Running in debug mode. Entry is not stored permanently, stdout and stderr are not captured, no git commit is created'
 MSG_START_ANALYSIS = 'Updating analysis'
 MSG_START_EXPERIMENT = lambda i,n,inp: (f'Running experiment {i+1}/{n}' + 
         (' with variable values {}{}'.format('\n\t' if '\n' in repr(inp) else '',repr(inp))
           if inp != {} else ''))
 MSG_START_GIT = lambda repo:'Creating snapshot of current working tree of repository \'{}\'. Check {}'.format(repo,FILE_GITLOG)
-MSG_ENTER_SCREEN = lambda session_name: f'Entering screen session {session_name}'
-MSG_START_SCREEN = 'To detach from session, press `Ctrl+a`, then `d`'
 def MSG_START_EXPERIMENTS(name,variables,parameters):
     msg = f'Will call `{name}`'
     extend=''
@@ -170,8 +161,9 @@ def MSG_START_EXPERIMENTS(name,variables,parameters):
 MSG_START_ENTRY = lambda directory: f'Created scilog entry {directory}'
 MSG_FINISH_EXPERIMENT = lambda i,n,runtime,result,external: 'Finished experiment {}/{} in {}{}'.format(i+1,n,string_from_seconds(runtime),
     '' if ('\n' in f'{result}') else (f'. Check {os.path.join(FILE_EXP(i),FILE_EXP_OUT)}' if external else f'. Output: {result}'))
-MSG_FINISH_ENTRY_SUCCESS = 'Completed scilog entry -- all experiments finished successfully'
-MSG_FINISH_ENTRY_FAIL = 'Completed scilog entry -- some experiments failed'
+MSG_FINISH_ENTRY=lambda directory: f'Completed scilog entry {directory}'
+MSG_SUCCESS = 'All experiments finished successfully'
+MSG_FAIL = 'Some experiments failed'
 MSG_FINISH_GIT = lambda sha1: f'Successfully created git commit {sha1}'
 MSG_ERROR_NOMATCH = 'Could not find matching scilog entry'
 MSG_ERROR_MULTIMATCH = lambda entries:'Multiple matching scilog entries (to iterate through all use need_unique=False):\n{}'.format('\n'.join(entries))
@@ -464,9 +456,9 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
                     _err.log(message=traceback.format_exc())
                     _log.log(group=GRP_ERROR, message=MSG_EXCEPTION_ANALYSIS)
     os.chdir(old_wd)
-    _log.log(MSG_FINISH_ENTRY_SUCCESS 
-             if all(s == 'finished' for s in info['experiments']['status']) 
-             else MSG_FINISH_ENTRY_FAIL)
+    _log.log(MSG_FINISH_ENTRY(directory))
+    if not all(s=='finished' for s in info['experiments']['status']):
+        _log.log(MSG_FAIL)
     return directory
 
 
@@ -488,8 +480,9 @@ def _get_base_directory(directory,func,name,no_date):
 
 def _get_name(func):
     if _external(func): 
-        oneword = re.compile('\w+')
-        name = oneword.match(func).group(0)
+        nowhite = re.compile('\S*')
+        path = nowhite.match(func).group(0)
+        name = os.path.basename(path)
     else:
         try:#func is a function or a class
             name = func.__name__
@@ -892,9 +885,11 @@ def analyze(entry,func, _log=None, _err=None, debug=False):
             shutil.rmtree(os.path.split(analysis_directory_tmp)[0], ignore_errors=True)
     except Exception:
         os.chdir(cwd)
+        
 class RE:
     def __init__(self,s):
         self.s=s
+
 def load(search_pattern='*', path='', ID=None, no_objects=False, need_unique=True,parameters=None):
     '''
     Load scilog entry/entries.
@@ -1086,6 +1081,7 @@ def _git_snapshot(path, commit_body, ID):
         raise GitError(traceback.format_exc(), out)
     os.chdir(initial_directory)
     return snap_id, out, git_directory
+
 def _patch_screenrc():
     '''
     Prevent ending a screen session with Ctrl-D unless user has an opinion about that
@@ -1101,323 +1097,4 @@ def _patch_screenrc():
             break
     else:
         with open(screenrc_path,'a+') as fp:
-            fp.write('setenv IGNOREEOF 5\n')
-def main():
-    import textwrap
-    parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter,
-        description=
-        '''
-        Call FUNC once or multiple times and store results along with auxiliary information
-        about runtime and memory usage, installed modules, source code, hardware, etc.
-        
-        For example, FUNC can be a numerical algorithm and VARIABLES
-        can be used to specify different mesh resolutions 
-        with the goal to assess the rate of convergence.
-
-        FUNC is called once for each combination of variable values.
-        (a) If FUNC is a callable, variables can be specified by enclosing with `var(*)`
-            a Python expression that results in an iterable. 
-            For example, to call the function `foo` in module `bar` with all entries 
-            of `range(4)` in the first argument and `42` in the second, run:
-                $ scilog 'foo.bar(a=var(range(4)),b=42)'
-            (NOTE: FOR THE TIME BEING, THIS REQUIRES SPECIFICATION OF ARGUMENT NAMES!)
-            If `foo.bar` is provided without parentheses, the arguments will be asked 
-            for in an interactive command line interface.  
-        (b) If FUNC is a bash command string, placeholders can be specified by braces
-            and variable ranges specified with the command line argument VARIABLES. 
-            For example, try:
-                $ scilog 'echo {ARG}' --variables 'arg=range(4)'
-            specified by the variable ranges in VARIABLES.
-            If there are further parameters that don't have to be varied but should be 
-            recorded, they may be specified with PARAMETERS, e.g.:
-                $ scilog 'echo {ARG0}{ARG1}' --variables 'arg0=range(4)' --parameters 'arg1=42'
-        (c) If FUNC is a Python class definition, parameters for ininitialization of this class
-            can be specified with the command line argument PARAMETERS. The class is instantiated 
-            only once and all calls will be made to that instance. Variables for these calls can 
-            be specified with VARIABLES. Alternatively, both instance parameters and call variables
-            can be chosen in an interactive command line interface. 
-
-        In the following, each call of FUNC is called an 'experiment'.
-
-        Scilog creates a directory (using NAME and the current date, and optionally DIRECTORY)
-        with the following content:
-            *summary.txt:
-                *name: Name of scilog entry
-                *ID: Alphanumeric 8 character string identifying the entry
-                *modules: Module versions
-                *time: Time of execution
-                *experiments: For each experiment
-                    *string representation of input, 
-                    *string representation of output,
-                    *runtime
-                    *status
-                    *(optional)peak memory usage
-            *log.txt
-            *(optional)err.txt
-            *(optional)git.txt: stdout of git snapshot creation 
-            *source.txt: Source code of the module containing FUNC
-            *For each experiment a subdirectory 'experiment<i>' with:
-                *output.pkl: Output of FUNC
-                *(optional)input.pkl: Argument passed to FUNC
-                *(optional) working_directory/: Working directory for call of FUNC
-                    unless COPY is specified, in which
-                    case the working directory is left as is
-                *(optional)stderr.txt:
-                *(optional)stdout.txt:
-                *(optional)runtime_profile.txt: Extensive runtime information for each experiment
-                *(optional)memory_profile.txt: Memory usage information for each experiment
-            *(optional) analysis/: output of ANALYZE
-                *(optional)stderr.txt
-                *(optional)stdout.txt
-                *(optional)working_directory/: Working directory for call of ANALYZE
-
-        To display information about an existing scilog entry in the command line,
-        the argument --show may be passed to this script.)
-        ''')
-    parser.add_argument('func', action='store',
-        help=textwrap.dedent(
-        '''\
-        Function, bash command string, or class to perform experiments with.
-        '''))
-    parser.add_argument('-v', '--variables', action='store', default=None,
-        help=textwrap.dedent(
-        '''\
-        Name value pair of variables and their range.
-        Use Python keyword argument style.
-        For example, "--variables N=range(10),M=[1.2,4.3]" 
-        will result in 20=10*2 experiments.  
-
-        '''))
-    parser.add_argument('-p', '--parameters', action='store', default=None,
-        help=textwrap.dedent(
-        '''\
-        Parameters that are equal for all experiments.
-        Use Python keyword argument style, e.g.: "h=0.1,eps=0.01"
-        If argument FUNC is a function, PARAMETERS are passed
-        along the entries of VARIABLES in form of keyword arguments to FUNC.
-        If argument FUNC specifies a class, the class is initialized
-        with PARAMETERS as keyword arguments.
-        If argument FUNC is a bash command string, PARAMETERS
-        are used to fill braces not specified by VARIABLES. 
-        For example
-            $ scilog "my_func {} -d {dir}" --variables range(2) --parameters "dir='/my/path'" 
-        results in the following commands to be executed:
-                 1) my_func 0 -d /my/path
-                 2) my_func 1 -d /my/path.
-        '''))
-    parser.add_argument('-n', '--name', action='store', default=None,
-        help=textwrap.dedent(
-        '''\
-        Name of the scilog entry.
-        If not provided, name is derived from FUNC.
-        '''))
-    parser.add_argument('-a', '--analyze', action='store',
-        nargs='?', const='analyze', default=None,
-        help=textwrap.dedent(
-        '''\
-        Function that is used to perform analysis after each experiment.
-        By default, ANALYZE is assumed to be the name of a function in the same module as FUNC.
-        Alternatively, ANALYZE can be
-            1) the full path of a Python function in some different module,
-                e.g.: foo2.analyze
-            2) the name of a method of the class specified by FUNC.
-        '''))
-    parser.add_argument('-d', '--directory', action='store', default=None,
-        help=textwrap.dedent(
-        '''\
-        Scilog base directory.
-        '''))
-    parser.add_argument('--parallel', action='store_true',
-        help=textwrap.dedent(
-        '''\
-        Perform experiments in parallel.
-        '''))
-    parser.add_argument('-m', '--memory_profile', action='store_true',
-        help=textwrap.dedent(
-        '''\
-        Store memory information for each experiment.
-        '''))
-    parser.add_argument('-r', '--runtime_profile', action='store_true',
-        help=textwrap.dedent(
-        '''\
-        Store extensive runtime information for each experiment.
-        The total time of each experiment is always stored.
-        '''))
-    parser.add_argument('-g', '--git', action='store_true',
-        help=textwrap.dedent(
-        '''\
-        Create git snapshot commit.
-        The repository path may be specified, else it will be automatically detected
-        The resulting commit is tagged with the entry ID and resides outside the branch history.
-        Add 'scilog' to your .gitignore to avoid storing the scilog entries in each snapshot.  
-        (Should you ever want get rid of the snapshots, 
-        use `git tag --list 'scilog_*'|xargs -I %% git tag -d %%` to remove all scilog commits or 
-        use function `clean_git_repository` to remove all scilog commits whose scilog entry does not reside in repository anymore)
-        '''))
-    parser.add_argument('--no_date', action='store_true',
-        help=textwrap.dedent(
-        '''\
-        Do not store scilog entry in subdirectories based on current date.
-        '''))
-    parser.add_argument('--debug',action = 'store_true',
-        help=textwrap.dedent(
-        '''\
-        Run scilog in debug mode.
-        '''))
-    parser.add_argument('--external', action='store_true',
-        help=textwrap.dedent(
-        '''\
-        Specify that FUNC describes an external call.
-        This is only needed, when FUNC could be confused for a Python module, 
-        e.g., when FUNC=`foo.sh`.
-        '''))
-    parser.add_argument('-s', '--show', action='store_true',
-        help=textwrap.dedent(
-        '''\
-        Print information of previous entry/entries instead of creating new entry.
-        In this case, FUNC must the path of an existing scilog entry.
-        (Shell-style wildcards, e.g. "foo*", are recognized.)
-        Furthermore, the --git flag can be used to show the differences of the
-        working directory and the repository at the time
-        of the creation of the scilog entry.
-        '''))
-    parser.add_argument('-c', '--copy', action='store', nargs='?', const='.',
-        default=None,
-        help=textwrap.dedent(
-        '''\
-        Directory where FUNC stores its output.
-        If not specified, FUNC will be run in a clean working directory
-        and it is assumed that its outputs are stored in that working directory.
-        If flag is specified without path, current working directory is used.
-        '''))
-    parser.add_argument('--noscreen',action='store_true',
-        help=textwrap.dedent(
-        '''\
-        Use if `screen` is not available or is broken. 
-        '''
-        ))
-    #parser.add_argument('--holdon',action='store_true',help=argparse.SUPPRESS)
-    args = parser.parse_args()
-    if args.show:
-        entries = load(search_pattern=args.func, no_objects=True, need_unique=False)
-        entries = list(entries)
-        if len(entries) != 1:
-            print(STR_MULTI_ENTRIES(len(entries)))
-        for entry in entries:
-            print(STR_ENTRY(entry))
-            if args.git and entry['gitcommit']:
-                print(STR_GITDIFF)
-                try:
-                    subprocess.call(['gitdiffuntracked', entry['gitcommit']])
-                except subprocess.CalledProcessError:
-                    pass
-    else:
-        if args.variables is None:
-            variables = None
-        else:
-            variables = eval(f'(lambda **kwargs: kwargs)({args.variables})',{'__builtins__':{'range':range}},{})
-        if args.parameters is None:
-            parameters = None
-        else:
-            parameters = eval(f'(lambda **kwargs: kwargs)({args.parameters})',{'__builtins__':{'range':range}},{})
-        python_function_s = re.compile('\s*(\w+\.)+(\w+)(\(.*\))?\s*$')#re.compile('(\w+\.)+(\w+)(\(*\))?')
-        python_function_match = python_function_s.match(args.func)
-        external = args.external or not python_function_match 
-        if not external:#Assume args.func describes a Python class or function
-            not_module = False #Do not treat args.func as if it was only a module without callable name
-            if python_function_match.group(3):
-                not_module = True
-                if args.parameters or args.variables:
-                    raise ValueError('Parameters or variables specified more than once')
-                args.func = args.func.split('(')[0]
-                vp_args,vars_and_pars = eval(f'(lambda *args,**kwargs: (args,kwargs)){python_function_match.group(3)}',{'__builtins__':{'range':range}},{'var':_var})
-                if vp_args:
-                    raise ValueError('All arguments to Python function must be named (omit parentheses in scilog call for interactive argument specification)')
-                variables = {key:value.obj for key,value  in vars_and_pars.items() if isinstance(value,_var)}
-                parameters ={key:value for key,value in vars_and_pars.items() if not isinstance(value,_var)}
-            try:#Assume that args.func is a module path containing class or function of same name
-                if not_module:#Skip to below
-                    raise ImportError
-                module = importlib.import_module(args.func)
-            except ImportError:#Assume that args.func is module path plus trailing function or class name
-                module_name = '.'.join(args.func.split('.')[:-1])
-                module = importlib.import_module(module_name)
-            try: #Assume class is last part of args.func argument
-                class_or_function_name = args.func.split('.')[-1]
-                func = getattr(module, class_or_function_name)
-            except AttributeError as ae1:  # Or maybe last part but capitalized?
-                class_or_function_name2 = class_or_function_name.title()
-                try:
-                    func = getattr(module, class_or_function_name2)
-                except AttributeError:
-                    raise ValueError(f'`{class_or_function_name}` is not a callable or class in module `{module.__name__}` at {module.__file__}') from None
-        else:#Assume the module describes an external call
-            python_incomplete_function_s = re.compile('\s*(\w+)\(.*\)\s*$')#TODO:warn about externals that look like python calls with forgotten module
-            python_incomplete_function_match =  python_incomplete_function_s.match(args.func)
-            if python_incomplete_function_match:
-                raise ValueError(f'Did you forget to specify a module for Python function `{python_incomplete_function_match.group(1)}`?')
-            func = args.func
-        if args.analyze:
-            try:
-                split_analyze = args.analyze.split('.')
-                try:
-                    if len(split_analyze) > 1:  # Analyze function in different module
-                        analyze_module = importlib.import_module('.'.join(split_analyze[:-1]))
-                    else:
-                        analyze_module = module
-                    analyze_fn = getattr(analyze_module, split_analyze[-1])
-                except AttributeError:  # is analyze maybe a function of class instance?
-                    analyze_fn = getattr(func, args.analyze)
-            except Exception:
-                analyze_fn = None
-                traceback.print_exc()
-                warnings.warn(MSG_ERROR_LOAD('function {}'.format(args.analyze)))
-        else:
-            analyze_fn = None
-        if not args.noscreen:
-            try:
-                _patch_screenrc()
-            except Exception:
-                pass 
-            variables,parameters,_,classification = _setup_experiments(variables,parameters,func)
-            session_name = (args.name or _get_name(func))+'.'+classification
-            #(_,slave)=pty.openpty()
-            remaining_argv = []
-            i=-1
-            while True:
-                i+=1
-                if i>=len(sys.argv):
-                    break
-                if sys.argv[i] in ['--parameters','--variables','-p','-v']:
-                    i+=1#also skip arguments
-                    continue
-                remaining_argv.append(sys.argv[i])
-            argumenter = lambda d: ', '.join(f'{key}={repr(value)}' for key,value in d.items())
-            remaining_argv.extend(['--variables',argumenter(dict(variables)),'--parameters',argumenter(parameters),'--noscreen'])#abuse noscreen flag for inner scilog session
-            #print(['screen','-dmS', session_name,*remaining_argv])
-            print(MSG_ENTER_SCREEN(session_name))
-            subprocess.run(['screen','-S', session_name,*remaining_argv])
-        else:
-            try:
-                if args.noscreen:#abuse noscreen flag to recognize inner scilog session
-                    print(MSG_START_SCREEN)
-                record(
-                    func=func, 
-                    directory=args.directory,
-                    variables=variables,
-                    name=args.name,
-                    analysis=analyze_fn,
-                    runtime_profile=args.runtime_profile,
-                    memory_profile=args.memory_profile,
-                    git=args.git,
-                    no_date=args.no_date,
-                    parallel=args.parallel,
-                    copy_output=args.copy,
-                    debug = args.debug,
-                    parameters=parameters
-                )
-            except:#this try-except is needed in particular within screen: screen session terminates as soon as the inner scilog run ends, so the inner scilog sesssion must not end
-                traceback.print_exc()
-            input('Press Enter to exit')
-if __name__ == '__main__':
-    main()
+            fp.write('# added by scilog\nsetenv IGNOREEOF 5\n')
