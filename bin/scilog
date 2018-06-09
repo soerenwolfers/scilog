@@ -263,7 +263,6 @@ def main():
     args.func = ' '.join(args.func)
     if not args.func:
         parser.print_help()
-    quit()
     try:
         if args.show:
             entries = scilog.load(search_pattern=args.func, no_objects=True, need_unique=False)
@@ -351,17 +350,6 @@ def main():
                     pass 
                 variables,parameters,_,classification = scilog._setup_experiments(variables,parameters,func)
                 session_name = (args.name or scilog._get_name(func))+'.'+classification
-                #(_,slave)=pty.openpty()
-                #remaining_argv = []
-                #i=-1
-                #while True:
-                #    i+=1
-                #    if i>=len(sys.argv):
-                #        break
-                #    if sys.argv[i] in ['--parameters','--variables','-p','-v']:
-                #        i+=1#also skip arguments
-                #        continue
-                #    remaining_argv.append(sys.argv[i])
                 argumenter = lambda d: (', '.join(f'{key}={repr(value)}' for key,value in d.items())) if d else '{}'
                 remaining_argv=[]
                 if parameters:

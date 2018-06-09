@@ -333,7 +333,13 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
         'hardware' : sys_info.hardware(),
         'gitcommit' : None,
         'modules' : None,
-        'experiments' : []
+        'experiments' : {
+            'runtime':[],
+            'memory':[],
+            'status':[],
+            'input':[],
+            'output':[]     
+        }
     }
     if not external:
         info['modules'] = sys_info.modules()
@@ -381,13 +387,13 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
         _log.log(group=GRP_WARN, message=MSG_WARN_DILL)
     _try_store(aux_data,serializer,aux_data_file,_log,_err)
     def _update_info(i, runtime, status, memory, input_str, output_str):
-        info['experiments'].append({
-            'runtime':runtime,
-            'memory':memory if memory_profile is not False else None,
-            'status':status,
-            'input':input_str,
-            'output':output_str,
-        })
+        for (key,val) in [('runtime',runtime),
+            ('memory',memory if memory_profile is not False else None),
+            ('status',status),
+            ('input',input_str),
+            ('output',output_str),
+            ]:
+            info['experiments'][key].append(val)
         store_info()
     def store_info():
         with open(info_file,'w') as fp:
@@ -424,7 +430,6 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
             _log.log(group=GRP_WARN, message=MSG_WARN_PARALLEL)
             from multiprocessing import Pool
             pool = Pool(processes=n_experiments)
-        #info['experiments']['status'] = ['running']*n_experiments
         try:
             outputs = pool.map(_run_single_experiment, args)
         except pickle.PicklingError:  # @UndefinedVariable
@@ -437,8 +442,6 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
         pool.join()
     else:
         for arg in args:
-            #info['experiments']['status'][arg[0]] = 'running'
-            #store_info()
             try:
                 output = _run_single_experiment(arg)
             except Exception:
@@ -460,7 +463,7 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
                     _log.log(group=GRP_ERROR, message=MSG_EXCEPTION_ANALYSIS)
     os.chdir(old_wd)
     _log.log(MSG_FINISH_ENTRY(directory))
-    if not all(ex['status']=='finished' for ex in info['experiments']):
+    if not all(s=='finished' for s in info['experiments']['status']):
         _log.log(MSG_FAIL)
     return directory
 
@@ -765,15 +768,14 @@ class ConvergencePlotter():
         self.reference = reference
     def __call__(self, entry):
         experiments = entry['experiments']
-        #results = experiments['output']
         single_reference = (self.reference == 'self')
-        ind_finished = [j for (j, ex) in enumerate(experiments) if ex['status'] == 'finished']
+        ind_finished = [j for (j, s) in enumerate(experiments['status']) if s == 'finished']
         if len(ind_finished) > 2 + (self.extrapolate if self.extrapolate >= 0 else 0):
             if self.work is None:
-                times = [experiments[i]['runtime'] for i in ind_finished]
+                times = experiments['runtime'][ind_finished]
             else:
                 times = [self.work(i) for i in ind_finished]
-            results = [experiments[i]['output'] for i in ind_finished]
+            results = experiments[i]['output'][ind_finished]
             if self.cumulative:
                 times = np.cumsum(times)
             if not self.qois:
@@ -944,13 +946,16 @@ def load(search_pattern='*', path='', ID=None, no_objects=False, need_unique=Tru
                 raise ValueError(f'Problem with {file_name}') 
         info['path'] = entry
         if not no_objects:
-            for (j, ex) in enumerate(info['experiments']):
-                if ex['status'] == 'finished':
+            #if isinstance(info['experiments'],dict):#Old version of scilog:
+            #    DL = info['experiments']
+            #    info['experiments'] = [dict(zip(DL,t)) for t in zip(*DL.values())]
+            for j,s in enumerate(info['experiments']['status']):
+                if s == 'finished':
                     try:
                         output_file_name = os.path.join(entry, FILE_EXP(j), FILE_OUTPUT)
                         with open(output_file_name, 'rb') as fp:
                             output = deserializer.load(fp)
-                        ex['output'] = output
+                        info['experiments']['output'][j] = output
                     except Exception:
                         warnings.warn(MSG_ERROR_LOAD('file ' + output_file_name))
                         traceback.print_exc()
@@ -958,10 +963,15 @@ def load(search_pattern='*', path='', ID=None, no_objects=False, need_unique=Tru
                     input_file_name = os.path.join(entry,FILE_EXP(j),FILE_INPUT)
                     with open(input_file_name,'rb') as fp:
                         input = deserializer.load(fp)
-                    ex['input'] = input
+                    info['experiments']['input'][j] = input
                 except Exception:
                     warnings.warn(MSG_ERROR_LOAD('file ' + input_file_name))
                     traceback.print_exc()
+            for key in info['experiments']:
+                try:
+                    info['experiments'][key] = np.array(info['experiments'][key])
+                except Exception:
+                    pass
         return info
     if ID:
         partial_id = re.compile(ID)
@@ -1091,7 +1101,7 @@ def _git_snapshot(path, commit_body, ID):
 
 def _patch_screenrc():
     '''
-    Prevent ending a screen session with Ctrl-D unless user has an opinion about that
+    Prevent ending a screen session with Ctrl+d unless user has an opinion about that
     '''
     screenrc_path=os.path.join(str(pathlib.Path.home()),'.screenrc')
     try:
