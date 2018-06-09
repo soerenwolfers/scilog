@@ -24,7 +24,7 @@ class PostInstallCommand(install):
         install.run(self)
 setup(
     name='scilog',
-    version='1.5',
+    version='1.5.1',
     python_requires='>=3',
     long_description=open('README.rst').read(),
     description='Keep track of numerical experiments',
