@@ -15,6 +15,7 @@ import importlib
 import re
 import pathlib
 import types
+import operator
 import subprocess
 import shlex
 import json
@@ -137,7 +138,7 @@ STR_PARAMETERS_HELP = lambda allow_variables: (
                         )
 MSG_DEBUG =  'Running in debug mode. Entry is not stored permanently, stdout and stderr are not captured, no git commit is created'
 MSG_START_ANALYSIS = 'Updating analysis'
-MSG_START_EXPERIMENT = lambda i,n,inp: (f'Running experiment {i+1}/{n}' + 
+MSG_START_EXPERIMENT = lambda i,n_experiments,inp: (f'Running experiment {i+1}{f"/{n_experiments}" if n_experiments is not None else ""}' + 
         (' with variable values {}{}'.format('\n\t' if '\n' in repr(inp) else '',repr(inp))
           if inp != {} else ''))
 MSG_START_GIT = lambda repo:'Creating snapshot of current working tree of repository \'{}\'. Check {}'.format(repo,FILE_GITLOG)
@@ -159,7 +160,7 @@ def MSG_START_EXPERIMENTS(name,variables,parameters):
         extend =' once'
     return msg + extend
 MSG_START_ENTRY = lambda directory: f'Created scilog entry {directory}'
-MSG_FINISH_EXPERIMENT = lambda i,n,runtime,result,external: 'Finished experiment {}/{} in {}{}'.format(i+1,n,string_from_seconds(runtime),
+MSG_FINISH_EXPERIMENT = lambda i,n_experiments,runtime,result,external: 'Finished experiment {}{} in {}{}'.format(i+1,f'/{n_experiments}' if n_experiments is not None else '',string_from_seconds(runtime),
     '' if ('\n' in f'{result}') else (f'. Check {os.path.join(FILE_EXP(i),FILE_EXP_OUT)}' if external else f'. Output: {result}'))
 MSG_FINISH_ENTRY=lambda directory: f'Completed scilog entry {directory}'
 MSG_SUCCESS = 'All experiments finished successfully'
@@ -297,9 +298,15 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
         if not String.valid(git):
             git = _get_func_directory(func) #Can't use base_directory, because user specified directory shouldn't be used for git
     variables,parameters,func_initialized,classification = _setup_experiments(variables,parameters,func)
-    t = itertools.product(*[variable[1] for variable in variables])
-    inputs = [{variable[0]:tt[i] for i,variable in enumerate(variables)} for tt in t]
-    n_experiments = len(inputs)
+    if len(variables)!=1:#Will result in infinite loop if one variable is infinite. 
+        t = itertools.product(*[variable[1] for variable in variables])
+    else:
+        t = ([x] for x in variables[0][1])
+    inputs = ({variable[0]:tt[i] for i,variable in enumerate(variables)} for tt in t)
+    try:
+        n_experiments = int(np.prod([len(variable[1]) for variable in variables]))
+    except TypeError:
+        n_experiments = None
     ########################### CREATE SCILOG ENTRY ###########################
     directory,ID = _get_directory(directory,func,name,no_date,debug,git,classification)
     log_file = os.path.join(directory, FILE_LOG)
@@ -326,13 +333,7 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
         'hardware' : sys_info.hardware(),
         'gitcommit' : None,
         'modules' : None,
-        'experiments' : {
-            'runtime':[None] * n_experiments, 
-            'memory':[None] * n_experiments, 
-            'output':[None] * n_experiments, 
-            'status':['queued'] * n_experiments,
-            'input':[str(input) for input in inputs]
-        }
+        'experiments' : []
     }
     if not external:
         info['modules'] = sys_info.modules()
@@ -379,12 +380,14 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
         serializer = pickle
         _log.log(group=GRP_WARN, message=MSG_WARN_DILL)
     _try_store(aux_data,serializer,aux_data_file,_log,_err)
-    def _update_info(i, runtime, status, memory, output_str):
-        info['experiments']['runtime'][i] = runtime
-        if memory_profile is not False:
-            info['experiments']['memory'][i] = memory
-        info['experiments']['status'][i] = status
-        info['experiments']['output'][i] = output_str
+    def _update_info(i, runtime, status, memory, input_str, output_str):
+        info['experiments'].append({
+            'runtime':runtime,
+            'memory':memory if memory_profile is not False else None,
+            'status':status,
+            'input':input_str,
+            'output':output_str,
+        })
         store_info()
     def store_info():
         with open(info_file,'w') as fp:
@@ -421,7 +424,7 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
             _log.log(group=GRP_WARN, message=MSG_WARN_PARALLEL)
             from multiprocessing import Pool
             pool = Pool(processes=n_experiments)
-        info['experiments']['status'] = ['running']*n_experiments
+        #info['experiments']['status'] = ['running']*n_experiments
         try:
             outputs = pool.map(_run_single_experiment, args)
         except pickle.PicklingError:  # @UndefinedVariable
@@ -434,8 +437,8 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
         pool.join()
     else:
         for arg in args:
-            info['experiments']['status'][arg[0]] = 'running'
-            store_info()
+            #info['experiments']['status'][arg[0]] = 'running'
+            #store_info()
             try:
                 output = _run_single_experiment(arg)
             except Exception:
@@ -457,7 +460,7 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
                     _log.log(group=GRP_ERROR, message=MSG_EXCEPTION_ANALYSIS)
     os.chdir(old_wd)
     _log.log(MSG_FINISH_ENTRY(directory))
-    if not all(s=='finished' for s in info['experiments']['status']):
+    if not all(ex['status']=='finished' for ex in info['experiments']):
         _log.log(MSG_FAIL)
     return directory
 
@@ -490,6 +493,10 @@ def _get_name(func):
             name = func.__class__.__name__
     return name
 
+def _evaluator(what,locals_dict = None):
+    locals_dict = locals_dict or {}
+    return eval(f'(lambda **kwargs: kwargs)({what})',{'range':range,'count':itertools.count},locals_dict)
+
 class _var:
     def __init__(self,*obj):
         if len(obj)>1:
@@ -515,7 +522,7 @@ def _setup_experiments(variables,parameters,func):
         if variables is None:
             variables = {}
         if external:
-            field_names = [fname for _, fname, _, _ in Formatter().parse(external)]
+            field_names = [fname for _, fname, _, _ in Formatter().parse(external) if fname is not None]
             new_var_n = 0
             new_names = []
             for i,fname in enumerate(field_names):
@@ -530,7 +537,7 @@ def _setup_experiments(variables,parameters,func):
                 *[f'{{{new_name}}}' for new_name in new_names],
                 **{fname:f'{{{fname}}}' for fname in field_names if fname !='' }
             )
-            known_parameters = OrderedDict((fname,inspect._empty) for _, fname, _, _ in Formatter().parse(external))
+            known_parameters = OrderedDict((fname,inspect._empty) for _, fname, _, _ in Formatter().parse(external) if fname is not None)
             if len(known_parameters)==1 and list(known_parameters.keys())[0] == None:
                 known_parameters = []
             allow_all_keys = False
@@ -581,7 +588,7 @@ def _setup_experiments(variables,parameters,func):
                     print(STR_PARAMETERS_HELP(allow_variables))
                     continue
                 try:
-                    update_kwargs = eval(f'(lambda **kwargs: kwargs)({parameters_string})',{'__builtins__':{'range':range}},{'var':_var} if allow_variables else {})#ast.literal_eval('{'+parameters_string+'}')
+                    update_kwargs = _evaluator(parameters_string,{'var':_var} if allow_variables else {})
                 except Exception:#(ValueError,SyntaxError):
                     if '=help' in parameters_string:
                         print(STR_PARAMETERS_HELP(allow_variables))
@@ -657,6 +664,7 @@ def _run_single_experiment(arg):
     _log.log(MSG_START_EXPERIMENT(i,n_experiments,input))
     runtime = None
     output = None
+    input_str = repr(input)
     memory = None
     status = 'failed'
     randomstate = None
@@ -702,8 +710,8 @@ def _run_single_experiment(arg):
                             stderr_append = traceback.format_exc()
                         else:
                             status = 'finished'
-        delete_empty_files([stderr_file, stdout_file])
         runtime = timeit.default_timer() - tic
+        delete_empty_files([stderr_file, stdout_file])
         if status == 'failed':
             append_text(stderr_file, stderr_append)
             _log.log(group=GRP_ERROR, message=MSG_ERROR_EXPERIMENT(i),use_lock = False)#locks are often broken already which leads to ugly printouts, also errors don't matter at this point anyway
@@ -733,7 +741,7 @@ def _run_single_experiment(arg):
     if status == 'finished':
         _log.log(MSG_FINISH_EXPERIMENT(i, n_experiments, runtime, output_str,external))
     gc.collect()
-    return (i, runtime, status, memory, output_str)
+    return (i, runtime, status, memory, input_str, output_str)
 
 class ConvergencePlotter():
     def __init__(self, *qois, cumulative=False, work=None, extrapolate=0,reference = 'self'):
@@ -757,15 +765,15 @@ class ConvergencePlotter():
         self.reference = reference
     def __call__(self, entry):
         experiments = entry['experiments']
-        results = experiments['output']
+        #results = experiments['output']
         single_reference = (self.reference == 'self')
-        ind_finished = [j for (j, status) in enumerate(experiments['status']) if status == 'finished']
+        ind_finished = [j for (j, ex) in enumerate(experiments) if ex['status'] == 'finished']
         if len(ind_finished) > 2 + (self.extrapolate if self.extrapolate >= 0 else 0):
             if self.work is None:
-                times = [experiments['runtime'][i] for i in ind_finished]
+                times = [experiments[i]['runtime'] for i in ind_finished]
             else:
                 times = [self.work(i) for i in ind_finished]
-            results = [results[i] for i in ind_finished]
+            results = [experiments[i]['output'] for i in ind_finished]
             if self.cumulative:
                 times = np.cumsum(times)
             if not self.qois:
@@ -936,25 +944,24 @@ def load(search_pattern='*', path='', ID=None, no_objects=False, need_unique=Tru
                 raise ValueError(f'Problem with {file_name}') 
         info['path'] = entry
         if not no_objects:
-            for (j, status) in enumerate(info['experiments']['status']):
-                if status == 'finished':
+            for (j, ex) in enumerate(info['experiments']):
+                if ex['status'] == 'finished':
                     try:
                         output_file_name = os.path.join(entry, FILE_EXP(j), FILE_OUTPUT)
                         with open(output_file_name, 'rb') as fp:
                             output = deserializer.load(fp)
-                        info['experiments']['output'][j] = output
+                        ex['output'] = output
                     except Exception:
                         warnings.warn(MSG_ERROR_LOAD('file ' + output_file_name))
                         traceback.print_exc()
-                if status != 'queued':#No need to load input of experiments that weren't even attempted to be started yet
-                    try:
-                        input_file_name = os.path.join(entry,FILE_EXP(j),FILE_INPUT)
-                        with open(input_file_name,'rb') as fp:
-                            input = deserializer.load(fp)
-                        info['experiments']['input'][j] = input
-                    except Exception:
-                        warnings.warn(MSG_ERROR_LOAD('file ' + input_file_name))
-                        traceback.print_exc()
+                try:
+                    input_file_name = os.path.join(entry,FILE_EXP(j),FILE_INPUT)
+                    with open(input_file_name,'rb') as fp:
+                        input = deserializer.load(fp)
+                    ex['input'] = input
+                except Exception:
+                    warnings.warn(MSG_ERROR_LOAD('file ' + input_file_name))
+                    traceback.print_exc()
         return info
     if ID:
         partial_id = re.compile(ID)

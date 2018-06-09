@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/local/src/anaconda3/bin/python3
 # PYTHON_ARGCOMPLETE_OK
 def main():
     import argparse
@@ -56,17 +56,27 @@ def main():
             For example, to call the function `foo` in module `bar` with all entries 
             of `range(4)` in the first argument and `42` in the second, run:
                 $ scilog 'foo.bar(a=var(range(4)),b=42)'
-            (NOTE: FOR THE TIME BEING, THIS REQUIRES SPECIFICATION OF ARGUMENT NAMES!)
+            (Note1: the ticks are necessary to prevent the shell to interpret parentheses as subshell)
+            (Note2: At the moment, positional arguments are not supported, i.e., 
+                argument names must be specified!)
             If `foo.bar` is provided without parentheses, the arguments will be asked 
             for in an interactive command line interface.  
         (b) If FUNC is a bash command string, placeholders can be specified by braces
-            and variable ranges specified with the command line argument VARIABLES. 
+            and variable ranges can be specified with the command line argument VARIABLES. 
             For example, try:
-                $ scilog 'echo {ARG}' --variables 'arg=range(4)'
-            specified by the variable ranges in VARIABLES.
+                $ scilog --variables 'arg=range(3)' echo {arg} 
             If there are further parameters that don't have to be varied but should be 
-            recorded, they may be specified with PARAMETERS, e.g.:
-                $ scilog 'echo {ARG0}{ARG1}' --variables 'arg0=range(4)' --parameters 'arg1=42'
+            recorded, they may be specified with PARAMETERS. For example, to escape braces,
+            i.e. to prevent scilog form interpreting them as variable name, use 
+                $ scilog --variables 'arg0=range(4)' --parameters 'arg1="{42}"' echo {arg0}{arg1}
+                (note that second pair of ticks are required to prevent interpretation of double quotes by 
+                shell and allow them to be interpreted as Python string delimiters instead)
+            which allows for brace expansion in the following calls to and outputs of `echo`:
+                $ echo 0{42}
+                    0{42}
+                $ echo 1{42}
+                    1{42}
+                ...
         (c) If FUNC is a Python class definition, parameters for ininitialization of this class
             can be specified with the command line argument PARAMETERS. The class is instantiated 
             only once and all calls will be made to that instance. Variables for these calls can 
@@ -110,7 +120,7 @@ def main():
         To display information about an existing scilog entry in the command line,
         the argument --show may be passed to this script.)
         ''')
-    parser.add_argument('func', action='store',
+    parser.add_argument('func', action='store',nargs = argparse.REMAINDER,
         help=textwrap.dedent(
         '''\
         Function, bash command string, or class to perform experiments with.
@@ -240,6 +250,7 @@ def main():
     import traceback
     import warnings
     import importlib
+    import itertools
     from scilog import scilog
     STR_ENTRY = lambda entry: ('=' * 80+'\nEntry \'{}\' at {}:\n'.format(entry['name'], entry['path'])
                 + '=' * 80 + '\n' + json.dumps({key:value for key,value in entry.items() if key != 'modules'}, sort_keys=True, indent=4, default=str)[1:-1])
@@ -249,113 +260,133 @@ def main():
     STR_GITDIFF = '\n The current working directory differs from the git repository at the time of the scilog entry as follows:'
     MSG_ERROR_SCREEN = 'Make sure GNU screen is installed on your system. Alternatively, try `--noscreen`'
     args = parser.parse_args()
-    if args.show:
-        entries = scilog.load(search_pattern=args.func, no_objects=True, need_unique=False)
-        entries = list(entries)
-        if len(entries) != 1:
-            print(STR_MULTI_ENTRIES(len(entries)))
-        for entry in entries:
-            print(STR_ENTRY(entry))
-            if args.git and entry['gitcommit']:
-                print(STR_GITDIFF)
-                try:
-                    subprocess.call(['gitdiffuntracked', entry['gitcommit']])
-                except subprocess.CalledProcessError:
-                    pass
-    else:
-        if args.variables is None:
-            variables = None
+    args.func = ' '.join(args.func)
+    if not args.func:
+        parser.print_help()
+    quit()
+    try:
+        if args.show:
+            entries = scilog.load(search_pattern=args.func, no_objects=True, need_unique=False)
+            entries = list(entries)
+            if len(entries) != 1:
+                print(STR_MULTI_ENTRIES(len(entries)))
+            for entry in entries:
+                print(STR_ENTRY(entry))
+                if args.git and entry['gitcommit']:
+                    print(STR_GITDIFF)
+                    try:
+                        subprocess.call(['gitdiffuntracked', entry['gitcommit']])
+                    except subprocess.CalledProcessError:
+                        pass
         else:
-            variables = eval(f'(lambda **kwargs: kwargs)({args.variables})',{'__builtins__':{'range':range}},{})
-        if args.parameters is None:
-            parameters = None
-        else:
-            parameters = eval(f'(lambda **kwargs: kwargs)({args.parameters})',{'__builtins__':{'range':range}},{})
-        python_function_s = re.compile('\s*(\w+(?:\.|:))+(\w+)(\(.*\))?\s*$')#re.compile('(\w+\.)+(\w+)(\(*\))?')
-        python_function_match = python_function_s.match(args.func)
-        external = args.external or not python_function_match 
-        if not external:#Assume args.func describes a Python class or function
-            not_module = False #Do not treat args.func as if it was only a module without callable name
-            if python_function_match.group(3):
-                not_module = True
-                if args.parameters or args.variables:
-                    raise ValueError('Parameters or variables specified more than once')
-                args.func = args.func.split('(')[0]
-                vp_args,vars_and_pars = eval(f'(lambda *args,**kwargs: (args,kwargs)){python_function_match.group(3)}',{'__builtins__':{'range':range}},{'var':scilog._var})
-                if vp_args:
-                    raise ValueError('All arguments to Python function must be named (omit parentheses in scilog call for interactive argument specification)')
-                variables = {key:value.obj for key,value  in vars_and_pars.items() if isinstance(value,scilog._var)}
-                parameters ={key:value for key,value in vars_and_pars.items() if not isinstance(value,scilog._var)}
-            args.func = args.func.replace(':','.')#At this point only a module name is left and in that, that are certainly no legal colons left except those that ended up there because of autocompletion
-            try:#Assume that args.func is a module path containing class or function of same name
-                if not_module:#Skip to below
-                    raise ImportError
-                module = importlib.import_module(args.func)
-            except ImportError:#Assume that args.func is module path plus trailing function or class name
-                module_name = '.'.join(args.func.split('.')[:-1])
-                module = importlib.import_module(module_name)
-            try: #Assume class is last part of args.func argument
-                class_or_function_name = args.func.split('.')[-1]
-                func = getattr(module, class_or_function_name)
-            except AttributeError as ae1:  # Or maybe last part but capitalized?
-                class_or_function_name2 = class_or_function_name.title()
+            if args.variables is  None:
+                variables = None
+            elif args.variables == '{}':
+                variables = {}
+            else:
+                variables = scilog._evaluator(args.variables)
+            if args.parameters is None:
+                parameters = None
+            elif args.parameters == '{}':
+                parameters = {}
+            else:
+                parameters = scilog._evaluator(args.parameters)
+            python_function_s = re.compile('\s*(\w+(?:\.|:))+(\w+)(\(.*\))?\s*$')#re.compile('(\w+\.)+(\w+)(\(*\))?')
+            python_function_match = python_function_s.match(args.func)
+            external = args.external or not python_function_match 
+            if not external:#Assume args.func describes a Python class or function
+                not_module = False #Do not treat args.func as if it was only a module without callable name
+                if python_function_match.group(3):
+                    not_module = True
+                    if args.parameters or args.variables:
+                        raise ValueError('Parameters or variables specified more than once')
+                    args.func = args.func.split('(')[0]
+                    vars_and_pars = scilog._evaluator(python_function_match.group(3),{'var':scilog._var})
+                    variables = {key:value.obj for key,value  in vars_and_pars.items() if isinstance(value,scilog._var)}
+                    parameters ={key:value for key,value in vars_and_pars.items() if not isinstance(value,scilog._var)}
+                args.func = args.func.replace(':','.')#At this point only a module name is left and in that, that are certainly no legal colons left except those that ended up there because of autocompletion
+                try:#Assume that args.func is a module path containing class or function of same name
+                    if not_module:#Skip to below
+                        raise ImportError
+                    module = importlib.import_module(args.func)
+                except ImportError:#Assume that args.func is module path plus trailing function or class name
+                    module_name = '.'.join(args.func.split('.')[:-1])
+                    module = importlib.import_module(module_name)
+                try: #Assume class is last part of args.func argument
+                    class_or_function_name = args.func.split('.')[-1]
+                    func = getattr(module, class_or_function_name)
+                except AttributeError as ae1:  # Or maybe last part but capitalized?
+                    class_or_function_name2 = class_or_function_name.title()
+                    try:
+                        func = getattr(module, class_or_function_name2)
+                    except AttributeError:
+                        raise ValueError(f'`{class_or_function_name}` is not a callable or class in module `{module.__name__}` at {module.__file__}') from None
+            else:#Assume the module describes an external call
+                python_incomplete_function_s = re.compile('\s*(\w+)\(.*\)\s*$')#TODO:warn about externals that look like python calls with forgotten module
+                python_incomplete_function_match =  python_incomplete_function_s.match(args.func)
+                if python_incomplete_function_match:
+                    raise ValueError(f'Did you forget to specify a module for Python function `{python_incomplete_function_match.group(1)}`?')
+                func = args.func
+            if args.analyze:
                 try:
-                    func = getattr(module, class_or_function_name2)
-                except AttributeError:
-                    raise ValueError(f'`{class_or_function_name}` is not a callable or class in module `{module.__name__}` at {module.__file__}') from None
-        else:#Assume the module describes an external call
-            python_incomplete_function_s = re.compile('\s*(\w+)\(.*\)\s*$')#TODO:warn about externals that look like python calls with forgotten module
-            python_incomplete_function_match =  python_incomplete_function_s.match(args.func)
-            if python_incomplete_function_match:
-                raise ValueError(f'Did you forget to specify a module for Python function `{python_incomplete_function_match.group(1)}`?')
-            func = args.func
-        if args.analyze:
-            try:
-                split_analyze = args.analyze.split('.')
-                try:
-                    if len(split_analyze) > 1:  # Analyze function in different module
-                        analyze_module = importlib.import_module('.'.join(split_analyze[:-1]))
-                    else:
-                        analyze_module = module
-                    analyze_fn = getattr(analyze_module, split_analyze[-1])
-                except AttributeError:  # is analyze maybe a function of class instance?
-                    analyze_fn = getattr(func, args.analyze)
-            except Exception:
+                    split_analyze = args.analyze.split('.')
+                    try:
+                        if len(split_analyze) > 1:  # Analyze function in different module
+                            analyze_module = importlib.import_module('.'.join(split_analyze[:-1]))
+                        else:
+                            analyze_module = module
+                        analyze_fn = getattr(analyze_module, split_analyze[-1])
+                    except AttributeError:  # is analyze maybe a function of class instance?
+                        analyze_fn = getattr(func, args.analyze)
+                except Exception:
+                    analyze_fn = None
+                    traceback.print_exc()
+                    warnings.warn(scilog.MSG_ERROR_LOAD('function {}'.format(args.analyze)))
+            else:
                 analyze_fn = None
-                traceback.print_exc()
-                warnings.warn(scilog.MSG_ERROR_LOAD('function {}'.format(args.analyze)))
-        else:
-            analyze_fn = None
-        if not args.noscreen:
-            try:
-                scilog._patch_screenrc()
-            except Exception:
-                pass 
-            variables,parameters,_,classification = scilog._setup_experiments(variables,parameters,func)
-            session_name = (args.name or scilog._get_name(func))+'.'+classification
-            #(_,slave)=pty.openpty()
-            remaining_argv = []
-            i=-1
-            while True:
-                i+=1
-                if i>=len(sys.argv):
-                    break
-                if sys.argv[i] in ['--parameters','--variables','-p','-v']:
-                    i+=1#also skip arguments
-                    continue
-                remaining_argv.append(sys.argv[i])
-            argumenter = lambda d: ', '.join(f'{key}={repr(value)}' for key,value in d.items())
-            remaining_argv.extend(['--variables',argumenter(dict(variables)),'--parameters',argumenter(parameters),'--noscreen'])#abuse noscreen flag for inner scilog session
-            #print(['screen','-dmS', session_name,*remaining_argv])
-            print(MSG_ENTER_SCREEN(session_name))
-            try:
-                subprocess.run(['screen','-S', session_name,*remaining_argv])
-            except FileNotFoundError:
-                raise FileNotFoundError(MSG_ERROR_SCREEN)
-        else:
-            try:
-                if args.noscreen:#abuse noscreen flag to recognize inner scilog session
-                    print(MSG_START_SCREEN)
+            if not args.noscreen:
+                try:
+                    scilog._patch_screenrc()
+                except Exception:
+                    pass 
+                variables,parameters,_,classification = scilog._setup_experiments(variables,parameters,func)
+                session_name = (args.name or scilog._get_name(func))+'.'+classification
+                #(_,slave)=pty.openpty()
+                #remaining_argv = []
+                #i=-1
+                #while True:
+                #    i+=1
+                #    if i>=len(sys.argv):
+                #        break
+                #    if sys.argv[i] in ['--parameters','--variables','-p','-v']:
+                #        i+=1#also skip arguments
+                #        continue
+                #    remaining_argv.append(sys.argv[i])
+                argumenter = lambda d: (', '.join(f'{key}={repr(value)}' for key,value in d.items())) if d else '{}'
+                remaining_argv=[]
+                if parameters:
+                    remaining_argv
+                remaining_argv = [
+                    '--parameters',argumenter(parameters),
+                    '--variables',argumenter(dict(variables)),
+                    '--noscreen'
+                ]
+                for key,value in args.__dict__.items():
+                    if key !='func':
+                        if isinstance(value,str):
+                            remaining_argv.extend(['--'+key,value])
+                        elif isinstance(value,bool):
+                            if value:
+                                remaining_argv.append('--'+key)
+                #remaining_argv.extend(['--variables',argumenter(dict(variables)),'--parameters',argumenter(parameters),'--noscreen'])#abuse noscreen flag for inner scilog session
+                remaining_argv.append(args.func)
+                print(MSG_ENTER_SCREEN(session_name))
+                try:
+                    subprocess.run(['screen','-S', session_name,sys.argv[0],*remaining_argv])
+                except FileNotFoundError:
+                    raise FileNotFoundError(MSG_ERROR_SCREEN) from None
+            else:
+                print(MSG_START_SCREEN)
                 scilog.record(
                     func=func, 
                     directory=args.directory,
@@ -371,9 +402,10 @@ def main():
                     debug = args.debug,
                     parameters=parameters
                 )
-            except:#this try-except is needed in particular within screen: screen session terminates as soon as the inner scilog run ends, so the inner scilog sesssion must not end
-                traceback.print_exc()
-            input('Press Enter to exit scilog session')
+    except:#this try-except is needed in particular within screen: screen session terminates as soon as the inner scilog run ends, so the inner scilog sesssion must not end
+        traceback.print_exc()
+    if args.noscreen:
+        input('Press Enter to exit scilog session')
 
 if __name__=='__main__':
     main()
