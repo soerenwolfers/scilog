@@ -138,7 +138,7 @@ STR_PARAMETERS_HELP = lambda allow_variables: (
                         )
 MSG_DEBUG =  'Running in debug mode. Entry is not stored permanently, stdout and stderr are not captured, no git commit is created'
 MSG_START_ANALYSIS = 'Updating analysis'
-MSG_START_EXPERIMENT = lambda i,n_experiments,inp: (f'Running experiment {i+1}{f"/{n_experiments}" if n_experiments is not None else ""}' + 
+MSG_START_EXPERIMENT = lambda i,n_experiments,inp: (f'Running experiment {i}' + 
         (' with variable values {}{}'.format('\n\t' if '\n' in repr(inp) else '',repr(inp))
           if inp != {} else ''))
 MSG_START_GIT = lambda repo:'Creating snapshot of current working tree of repository \'{}\'. Check {}'.format(repo,FILE_GITLOG)
@@ -160,7 +160,7 @@ def MSG_START_EXPERIMENTS(name,variables,parameters):
         extend =' once'
     return msg + extend
 MSG_START_ENTRY = lambda directory: f'Created scilog entry {directory}'
-MSG_FINISH_EXPERIMENT = lambda i,n_experiments,runtime,result,external: 'Finished experiment {}{} in {}{}'.format(i+1,f'/{n_experiments}' if n_experiments is not None else '',string_from_seconds(runtime),
+MSG_FINISH_EXPERIMENT = lambda i,n_experiments,runtime,result,external: 'Finished experiment {} in {}{}'.format(i,string_from_seconds(runtime),
     '' if ('\n' in f'{result}') else (f'. Check {os.path.join(FILE_EXP(i),FILE_EXP_OUT)}' if external else f'. Output: {result}'))
 MSG_FINISH_ENTRY=lambda directory: f'Completed scilog entry {directory}'
 MSG_SUCCESS = 'All experiments finished successfully'
@@ -191,10 +191,13 @@ MSG_INTERRUPT = f'Kill signal received. Stored {FILE_INFO}, closing now.'
 LEN_ID = 8
 
 #TODO think about using inspect.formatargspec(inspect.getargspec(func)) to directly parse args and kwargs of user input even without named argument
+#TODO understand ellipses in variable input
+#TODO check after each experiment that git has not changed
+#TODO if all experiments fail, delete git commit
 def record(func, variables=None, name=None, directory=None, aux_data=None,
             analysis=None, runtime_profile=False, memory_profile=False,
             git=False, no_date=False, parallel=False,
-            copy_output = None, parameters=None,debug = None):
+            copy_output = None, parameters=None,debug = None,classification= None):
     '''
     Call :code:`func` once or multiple times and store results along with auxiliary information
     about runtime and memory usage, installed modules, source code, hardware, etc.
@@ -285,6 +288,8 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
     :param debug: Boolean
     :param copy_output:  The contents of this directory will be copied into the scilog entry directory
     :type copy_output: String
+    :param classification: Short, human readable description of entry
+    :type classification: String
     :return: Path of scilog entry
     :rtype: String
     '''
@@ -297,7 +302,8 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
     if git is True:
         if not String.valid(git):
             git = _get_func_directory(func) #Can't use base_directory, because user specified directory shouldn't be used for git
-    variables,parameters,func_initialized,classification = _setup_experiments(variables,parameters,func)
+    variables,parameters,func_initialized,classification_t = _setup_experiments(variables,parameters,func)
+    classification = classification or classification_t
     if len(variables)!=1:#Will result in infinite loop if one variable is infinite. 
         t = itertools.product(*[variable[1] for variable in variables])
     else:
@@ -498,19 +504,23 @@ def _get_name(func):
 
 def _evaluator(what,locals_dict = None):
     locals_dict = locals_dict or {}
-    return eval(f'(lambda **kwargs: kwargs)({what})',{'range':range,'count':itertools.count},locals_dict)
+    return eval(f'(lambda **kwargs: kwargs)({what})',{'range':range,'count':itertools.count,'__builtins__':{}},locals_dict)
 
 class _var:
     def __init__(self,*obj):
-        if len(obj)>1:
+        if len(obj)>1:#e.g. var('ab','cd','ef')
             self.obj = obj
-        elif len(obj)==1:
-            self.obj=obj[0]
+        elif len(obj)==1:#e.g. var(range(3))
+            self.obj = obj[0]
         elif len(obj)==0:
             raise ValueError()
     def __repr__(self):
         return 'var('+repr(self.obj)+')'
 def _setup_experiments(variables,parameters,func):
+    '''
+    Note: input and output `variables` have iterator type, not _var. 
+    _var only occurs in the processing 
+    '''
     external = _external(func)
     def _get_kwargs(func,external,variables,parameters,class_instance=False):
         if inspect.isclass(func):
@@ -561,7 +571,7 @@ def _setup_experiments(variables,parameters,func):
         required_keys=lambda : [key for key in known_parameters if key not in kwargs]
         is_allowed_key=lambda key: allow_all_keys or key in known_parameters
         if variables:
-            if not isinstance(variables,dict):
+            if not isinstance(variables,dict):#allow for single range instead of var dictionary
                 non_default_parameters = [key for key in known_parameters if key not in default_parameters]
                 if len(non_default_parameters) == 1:
                     variables={non_default_parameters[0]:variables}
@@ -613,13 +623,13 @@ def _setup_experiments(variables,parameters,func):
     if external:
         def func(**kwargs):
             subprocess.check_call(external.format(**kwargs), stdout=sys.stdout, stderr=sys.stderr, shell=True)
-    classification_variables = variables.copy() if isinstance(variables,dict) else {}#can be None or a single unnamed iterable whose name will be found out only later 
-    classification_parameters = parameters.copy() if isinstance(parameters,dict) else {}# can be None
+    classification_variables = {}#variables.copy() if isinstance(variables,dict) else {}#can be None or a single unnamed iterable whose name will be found out only later 
+    classification_parameters = {}#parameters.copy() if isinstance(parameters,dict) else {}# can be None
     if inspect.isclass(func):# in this case, parameters are for initialization and variables for function call
         parameters,_,default_parameters,_ = _get_kwargs(func,False,None,parameters)
         func_initialized=func(**parameters)
         variables,_,default_parameters_2,known_parameters_2 = _get_kwargs(func_initialized,False,variables,None,class_instance=True)
-        real_variables = {key:value for key,value in variables.items() if isinstance(key,_var)}
+        real_variables = {key:value for key,value in variables.items() if isinstance(value,_var)}
         classification_parameters.update({key:value for key,value in parameters.items() if key not in default_parameters or (key in default_parameters and value !=default_parameters[key])})
         if len(variables)<=1:#nothing possibly interesting can be said if there is only one variable except if variable was not known (i.e. keyword argument) 
             if not classification_parameters:#If not any classification yet take what you have
@@ -630,10 +640,10 @@ def _setup_experiments(variables,parameters,func):
             classification_variables.update({key:value for key,value in variables.items() if key not in known_parameters_2 or (key in default_parameters_2 and value!=default_parameters_2[key])})
             if any(key not in real_variables for key in variables if not key in default_parameters_2):#Not all nondefault parameters actually vary, so list those that do
                 classification_variables.update({key:value for key,value in real_variables.items() if key not in default_parameters_2})
-        variables = {key:(value.obj if isinstance(value,_var) else [value]) for key,value in variables.items()}
+        variables = {key:(value.obj if isinstance(value,_var) else [value]) for key,value in variables.items()}#Users are prompeted vor variables or parameters, but if they enter parameters, i.e. a single value, the willy still be handled as variables taking only one value
     else:
         kwargs,external,default_parameters,_ =_get_kwargs(func,external,variables,parameters)#use all as name, first params as usual (all hand selected, fill to 5), then __var_l_h
-        variables = {key:value.obj for key,value  in kwargs.items() if isinstance(value,_var)}
+        variables = {key:value.obj for key,value in kwargs.items() if isinstance(value,_var)}
         parameters ={key:value for key,value in kwargs.items() if not isinstance(value,_var)}
         #use classification even if only one known parameter, this helps if the braces in a bash command string are changed and suddenly control something very different 
         classification_parameters.update({key:value for key,value in parameters.items() if key not in default_parameters or (key in default_parameters and value!=default_parameters[key])})
@@ -900,7 +910,7 @@ class RE:
     def __init__(self,s):
         self.s=s
 
-def load(search_pattern='*', path='', ID=None, no_objects=False, need_unique=True,parameters=None):
+def load(search_pattern='*', path='', ID=None, no_objects=False, need_unique=True,include_modules=False,parameters=None):
     '''
     Load scilog entry/entries.
    
@@ -945,6 +955,8 @@ def load(search_pattern='*', path='', ID=None, no_objects=False, need_unique=Tru
             except Exception:
                 raise ValueError(f'Problem with {file_name}') 
         info['path'] = entry
+        if not include_modules:
+            del info['modules']
         if not no_objects:
             #if isinstance(info['experiments'],dict):#Old version of scilog:
             #    DL = info['experiments']

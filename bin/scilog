@@ -226,6 +226,7 @@ def main():
         working directory and the repository at the time
         of the creation of the scilog entry.
         '''))
+    parser.add_argument('--classification',action = 'store',default = None)
     parser.add_argument('-c', '--copy', action='store', nargs='?', const='.',
         default=None,
         help=textwrap.dedent(
@@ -250,13 +251,12 @@ def main():
     import traceback
     import warnings
     import importlib
-    import itertools
     from scilog import scilog
     STR_ENTRY = lambda entry: ('=' * 80+'\nEntry \'{}\' at {}:\n'.format(entry['name'], entry['path'])
                 + '=' * 80 + '\n' + json.dumps({key:value for key,value in entry.items() if key != 'modules'}, sort_keys=True, indent=4, default=str)[1:-1])
     STR_MULTI_ENTRIES = lambda n:f'Found {n} entries'
     MSG_ENTER_SCREEN = lambda session_name: f'Entering screen session {session_name}'
-    MSG_START_SCREEN = 'To detach from scilog session, press `Ctrl+a`, then `d`'
+    MSG_START_SCREEN = 'To detach from scilog session, press `Ctrl+A`, then `D`'
     STR_GITDIFF = '\n The current working directory differs from the git repository at the time of the scilog entry as follows:'
     MSG_ERROR_SCREEN = 'Make sure GNU screen is installed on your system. Alternatively, try `--noscreen`'
     args = parser.parse_args()
@@ -300,7 +300,7 @@ def main():
                     if args.parameters or args.variables:
                         raise ValueError('Parameters or variables specified more than once')
                     args.func = args.func.split('(')[0]
-                    vars_and_pars = scilog._evaluator(python_function_match.group(3),{'var':scilog._var})
+                    vars_and_pars = scilog._evaluator(python_function_match.group(3)[1:-1],{'var':scilog._var})
                     variables = {key:value.obj for key,value  in vars_and_pars.items() if isinstance(value,scilog._var)}
                     parameters ={key:value for key,value in vars_and_pars.items() if not isinstance(value,scilog._var)}
                 args.func = args.func.replace(':','.')#At this point only a module name is left and in that, that are certainly no legal colons left except those that ended up there because of autocompletion
@@ -348,8 +348,9 @@ def main():
                     scilog._patch_screenrc()
                 except Exception:
                     pass 
-                variables,parameters,_,classification = scilog._setup_experiments(variables,parameters,func)
-                session_name = (args.name or scilog._get_name(func))+'.'+classification
+                variables,parameters,_,classification_t = scilog._setup_experiments(variables,parameters,func)
+                args.classification = args.classification or classification_t
+                session_name = (args.name or scilog._get_name(func))+'.'+args.classification
                 argumenter = lambda d: (', '.join(f'{key}={repr(value)}' for key,value in d.items())) if d else '{}'
                 remaining_argv=[]
                 if parameters:
@@ -357,16 +358,16 @@ def main():
                 remaining_argv = [
                     '--parameters',argumenter(parameters),
                     '--variables',argumenter(dict(variables)),
-                    '--noscreen'
+                    '--noscreen',
+                    '--classification',args.classification
                 ]
                 for key,value in args.__dict__.items():
-                    if key !='func':
+                    if key not in ['func','parameters','variables','noscreen','classification']:
                         if isinstance(value,str):
                             remaining_argv.extend(['--'+key,value])
                         elif isinstance(value,bool):
                             if value:
                                 remaining_argv.append('--'+key)
-                #remaining_argv.extend(['--variables',argumenter(dict(variables)),'--parameters',argumenter(parameters),'--noscreen'])#abuse noscreen flag for inner scilog session
                 remaining_argv.append(args.func)
                 print(MSG_ENTER_SCREEN(session_name))
                 try:
@@ -388,7 +389,8 @@ def main():
                     parallel=args.parallel,
                     copy_output=args.copy,
                     debug = args.debug,
-                    parameters=parameters
+                    parameters=parameters,
+                    classification = args.classification
                 )
     except:#this try-except is needed in particular within screen: screen session terminates as soon as the inner scilog run ends, so the inner scilog sesssion must not end
         traceback.print_exc()
