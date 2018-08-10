@@ -33,11 +33,11 @@ from matplotlib import pyplot
 from IPython.utils.capture import capture_output
 
 from swutil import sys_info, np_tools, plots, aux
-from swutil.validation import Positive, Integer, String
+from swutil.validation import Positive, Integer, String, List, Tuple
 from swutil.logs import Log
 from swutil.hpc import Locker
 from swutil.aux import  string_dialog, no_context, random_word,\
-    string_from_seconds,input_with_prefill,is_identifier
+    string_from_seconds,input_with_prefill,is_identifier,smart_range
 from swutil.files import append_text, delete_empty_files,\
     delete_empty_directories, find_directories, path_from_keywords
 from swutil.decorators import print_peak_memory, add_runtime
@@ -137,6 +137,7 @@ STR_PARAMETERS_HELP = lambda allow_variables: (
                             )
                         )
 MSG_DEBUG =  'Running in debug mode. Entry is not stored permanently, stdout and stderr are not captured, no git commit is created'
+MSG_NOGIT = 'Could not find git repository. No snapshot commit will be created'
 MSG_START_ANALYSIS = 'Updating analysis'
 MSG_START_EXPERIMENT = lambda i,n_experiments,inp: (f'Running experiment {i}' + 
         (' with variable values {}{}'.format('\n\t' if '\n' in repr(inp) else '',repr(inp))
@@ -191,12 +192,12 @@ MSG_INTERRUPT = f'Kill signal received. Stored {FILE_INFO}, closing now.'
 LEN_ID = 8
 
 #TODO think about using inspect.formatargspec(inspect.getargspec(func)) to directly parse args and kwargs of user input even without named argument
-#TODO understand ellipses in variable input
+#TODO understand ellipses in variable input: Do this at the string input level, so 2**3,...,2**6 can be understood. 
 #TODO check after each experiment that git has not changed
 #TODO if all experiments fail, delete git commit
 def record(func, variables=None, name=None, directory=None, aux_data=None,
             analysis=None, runtime_profile=False, memory_profile=False,
-            git=False, no_date=False, parallel=False,
+            git=True, no_date=False, parallel=False,
             copy_output = None, parameters=None,debug = None,classification= None):
     '''
     Call :code:`func` once or multiple times and store results along with auxiliary information
@@ -270,7 +271,7 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
     :type runtime_profile: Boolean
     :param memory_profile: Track memory usage
         May slow down execution
-    type memory_profile: Boolean
+    :type memory_profile: Boolean
     :param git: Create git snapshot commit
         The resulting commit is tagged with the entry ID and resides outside the branch history
         The repository path may be specified, else it will be automatically detected
@@ -280,7 +281,7 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
         use function `clean_git_repository` to remove all scilog commits whose scilog entry does not reside in repository anymore)
     :type git: Boolean or String
     :param no_date: Do not store outputs in sub-directories grouped by calendar week
-    :type date: Boolean
+    :type no_date: Boolean
     :param parameters: Parameters that are equal for all experiments
         If :code:`func` is a class, these are used to instantiate this class
     :type parameters: Dictionary
@@ -299,9 +300,13 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
     debug = debug if debug is not None else aux.isdebugging()
     if debug: 
         git = False
+    log_nogit = False
     if git is True:
         if not String.valid(git):
-            git = _get_func_directory(func) #Can't use base_directory, because user specified directory shouldn't be used for git
+            git = _get_func_directory(func)
+            if not _has_git(git):
+                log_nogit = True
+                git = False
     variables,parameters,func_initialized,classification_t = _setup_experiments(variables,parameters,func)
     classification = classification or classification_t
     if len(variables)!=1:#Will result in infinite loop if one variable is infinite. 
@@ -326,6 +331,8 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
     _log = Log(write_filter=True, print_filter=True, file_name=log_file,lock = locker.get_lock())  # Logging strategy: 1) Redirect out and err of user functions (analysis and experiment) to their own files
     _err = Log(write_filter=True, print_filter=False, file_name=err_file,lock = locker.get_lock())  # 2) Log errors outside user functions in _err 3) Log everything (user-err and _err, as well as other info) in _log 
     _log.log(MSG_START_ENTRY(directory))
+    if log_nogit:
+        _log.log(group = GRP_WARN,message = MSG_NOGIT)
     if debug:
         _log.log(group =GRP_WARN,message = MSG_DEBUG)
     info = {
@@ -339,6 +346,7 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
         'hardware' : sys_info.hardware(),
         'gitcommit' : None,
         'modules' : None,
+        'note': None,
         'experiments' : {
             'runtime':[],
             'memory':[],
@@ -417,16 +425,23 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
         for i, input in enumerate(inputs)
     )
     _log.log(message=MSG_START_EXPERIMENTS(name,variables,parameters))
-    def handler_stop_signals(*args):
-        store_info()
-        _log.log(MSG_INTERRUPT,use_lock=False)
-        sys.stdout.flush()
-        sys.stderr.flush()
-        sys.exit(1)
-    signal.signal(signal.SIGINT, handler_stop_signals)
-    signal.signal(signal.SIGTERM, handler_stop_signals)
-    signal.signal(signal.SIGABRT,handler_stop_signals)
-    signal.signal(signal.SIGHUP,handler_stop_signals)
+    def close_entry():
+        try:
+            os.chdir(old_wd)
+        except Exception:
+            pass
+        success = all(s=='finished' for s in info['experiments']['status'])
+        try:
+            _log.log(MSG_FINISH_ENTRY(directory))
+            if not success:
+                _log.log(MSG_FAIL)
+        except Exception:
+            pass
+        note = input('You may add a short note to this entry or simply press Enter to exit:')        
+        if note:
+            info['note'] = note
+            store_info()
+        return directory
     if parallel and not debug:
         try:
             from pathos.multiprocessing import ProcessingPool as Pool
@@ -459,7 +474,7 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
                 try:
                     _log.log(message=MSG_START_ANALYSIS)
                 except BrokenPipeError:#locks raise BrokenPipeError when experiments are terminated using <C-c>
-                    handler_stop_signals()
+                    sys.exit(1)
                 try:
                     with capture_output():
                         entry = load(path=directory, need_unique=True, no_objects=False)
@@ -467,12 +482,18 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
                 except Exception:
                     _err.log(message=traceback.format_exc())
                     _log.log(group=GRP_ERROR, message=MSG_EXCEPTION_ANALYSIS)
-    os.chdir(old_wd)
-    _log.log(MSG_FINISH_ENTRY(directory))
-    if not all(s=='finished' for s in info['experiments']['status']):
-        _log.log(MSG_FAIL)
-    return directory
+    close_entry()
 
+def _has_git(git):
+    cwd = os.getcwd()
+    try:
+        #subprocess.check_call(['git','status'],stdout = subprocess.PIPE,stderr=subprocess.PIPE)
+        subprocess.check_call(['git','rev-parse','HEAD',],stdout = subprocess.PIPE,stderr=subprocess.PIPE)#Sometimes git status works but rev-parse, which is used later, fails; e.g. on repos without initial commit
+        return True
+    except subprocess.CalledProcessError:
+        return False
+    finally:
+        os.chdir(cwd)
 
 def _external(func):
     return func if isinstance(func,str) else False
@@ -580,7 +601,7 @@ def _setup_experiments(variables,parameters,func):
                 else:
                     raise ValueError(f'Must specify name for variable {variables}')
             if any(not is_allowed_key(key) or not is_identifier(key) for key in variables):
-                raise ValueError('Invalid variable names: {}'.format({key for key in variables if not is_allowed_key(key)}))
+                raise ValueError('Invalid variable names for function {}: {}'.format(external or func,{key for key in variables if not is_allowed_key(key)}))
             variables_update = {key:_var(value) for key,value in variables.items()}
         else:
             variables_update = {}
@@ -588,7 +609,7 @@ def _setup_experiments(variables,parameters,func):
             if any(key in variables_update for key in parameters):
                 raise ValueError('Parameter names already defined as variables: {}'.format({key for key in parameters if key in kwargs}))
             if any(not is_allowed_key(key) or not is_identifier(key) for key in parameters):
-                raise ValueError('Invalid parameter names: {}'.format({key for key in parameters if not is_allowed_key(key)}))
+                raise ValueError('Invalid parameter names for function {}: {}'.format(external or func,{key for key in parameters if not is_allowed_key(key)}))
             parameters_update = parameters
         else:
             parameters_update = parameters
@@ -654,6 +675,9 @@ def _setup_experiments(variables,parameters,func):
     classification_p = path_from_keywords(classification_parameters,into='file')
     classification_v = '_'.join(s.replace('_','') for s in classification_variables.keys())
     classification = classification_p+('+' if classification_v else '') +classification_v 
+    for j,variable in enumerate(variables):
+        if (List|Tuple).valid(variable[1]) and Ellipsis in variable[1]:
+            variables[j] = (variable[0],smart_range(*[e for e in variable[1] if e != Ellipsis]))
     return variables,parameters,func_initialized,classification
 
 def _run_single_experiment(arg):
@@ -910,7 +934,7 @@ class RE:
     def __init__(self,s):
         self.s=s
 
-def load(search_pattern='*', path='', ID=None, no_objects=False, need_unique=True,include_modules=False,parameters=None):
+def load(search_pattern='*', path='', ID=None, no_objects=False, need_unique=True,include_modules=False,parameters=None,fix_broken_summary_txt=False):#TODO remove fix_borken_summary_txt
     '''
     Load scilog entry/entries.
    
@@ -961,24 +985,30 @@ def load(search_pattern='*', path='', ID=None, no_objects=False, need_unique=Tru
             #if isinstance(info['experiments'],dict):#Old version of scilog:
             #    DL = info['experiments']
             #    info['experiments'] = [dict(zip(DL,t)) for t in zip(*DL.values())]
-            for j,s in enumerate(info['experiments']['status']):
+            for j,s in enumerate(info['experiments']['status'] if not fix_broken_summary_txt else ('finished' for i in itertools.count())):
                 if s == 'finished':
                     try:
                         output_file_name = os.path.join(entry, FILE_EXP(j), FILE_OUTPUT)
                         with open(output_file_name, 'rb') as fp:
                             output = deserializer.load(fp)
-                        info['experiments']['output'][j] = output
+                        if fix_broken_summary_txt:
+                            info['experiments']['output'].append(output)
+                        else:
+                            info['experiments']['output'][j] = output
                     except Exception:
                         warnings.warn(MSG_ERROR_LOAD('file ' + output_file_name))
+                        if fix_broken_summary_txt:
+                            break
                         traceback.print_exc()
-                try:
-                    input_file_name = os.path.join(entry,FILE_EXP(j),FILE_INPUT)
-                    with open(input_file_name,'rb') as fp:
-                        input = deserializer.load(fp)
-                    info['experiments']['input'][j] = input
-                except Exception:
-                    warnings.warn(MSG_ERROR_LOAD('file ' + input_file_name))
-                    traceback.print_exc()
+                if not fix_broken_summary_txt: 
+                    try:
+                        input_file_name = os.path.join(entry,FILE_EXP(j),FILE_INPUT)
+                        with open(input_file_name,'rb') as fp:
+                            input = deserializer.load(fp)
+                        info['experiments']['input'][j] = input
+                    except Exception:
+                        warnings.warn(MSG_ERROR_LOAD('file ' + input_file_name))
+                        traceback.print_exc()
             for key in info['experiments']:
                 try:
                     info['experiments'][key] = np.array(info['experiments'][key])
@@ -1113,7 +1143,7 @@ def _git_snapshot(path, commit_body, ID):
 
 def _patch_screenrc():
     '''
-    Prevent ending a screen session with Ctrl+d unless user has an opinion about that
+    Prevent ending a screen session with Ctrl+D unless user has an opinion about that
     '''
     screenrc_path=os.path.join(str(pathlib.Path.home()),'.screenrc')
     try:
