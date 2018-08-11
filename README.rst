@@ -11,7 +11,7 @@ Since most computational research requires series of experiments, :code:`scilog`
 Using :code:`scilog 'foo.bar(x=var(1,2),y=2)'` does the same as above, but foo.bar is run once with :code:`x=1` and once with :code:`x=2`.
  
 Scilog can also be used for numerical experiments that are not based on Python. Using :code:`scilog --variables p=[0,1] 'my_tool {p}'`  the 
-command line tool :code:`my_tool` is run twice, with arguments `1` and `2`, respectively. 
+command line tool :code:`my_tool` is run twice, with arguments :code:`1` and :code:`2`, respectively. 
 
 Information on previous scilog entries can be displayed using `scilog --show 'my_tool'` or by simple navigating scilog's directory hierarchy, where 
 all entries are stored in the most human-readable form possible. 
