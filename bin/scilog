@@ -58,8 +58,6 @@ def main():
             return screens
     def ScreenCompleter(**kwargs):
         return get_screens()
-        #prefix = kwargs['prefix'].strip()
-        #return [screen for screen in get_screens() if screen.startswith(prefix)]
     parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter,
         description=
         textwrap.dedent(
@@ -81,8 +79,7 @@ def main():
         More non-trivially, a numerical algorithm may be executed with 
         different mesh resolutions to determine its rate of convergence:
             $ scilog 'my_module.my_algorithm(h=var([2**(-n) for n in range(5)]))'
-        (In the following, each call of the specified executable
-         is called an 'experiment'.)
+        (Each call of the executable is called an 'experiment' below)
 
         Scilog entries consist of the following files and subdirectories:
             *summary.txt:
@@ -124,8 +121,8 @@ def main():
             To call the function `foo` in module `bar` with all entries 
             of `range(4)` in the first argument and `42` in the second, run:
                 $ scilog 'foo.bar(a=var(range(4)),b=42)'
-            (* Quotes prevent interpretation of parentheses as subshell)
-            (* Positional arguments are not supported, argument names must be specified)
+            (Quotes prevent interpretation of parentheses as subshell)
+            (Positional arguments are not supported, argument names must be specified)
             If scilog is instead called with 
                 $ scilog foo.bar
             then arguments will be asked for in an interactive command line interface.  
@@ -139,7 +136,7 @@ def main():
                 $ scilog --variables 'a=["f","m"]' --parameters b="oo" echo {a}{b} 
             Example: To prevent scilog form interpreting braces as variable indicators: 
                 $ scilog --parameters 'arg="{42}"' echo {arg}
-                (* Single quotes prevent interpretation of double quotes by the shell
+                (Single quotes prevent interpretation of double quotes by the shell
                  and allow them to be interpreted as Python string delimiters instead)
         (c) Python classes:
             The specified class is instantiated and all calls are made to instance.
@@ -190,11 +187,11 @@ def main():
         help=textwrap.dedent(
         '''\
         Function that analyzes entry after each experiment.
-        ANALYZE can be
-            1) name of a function in same module as FUNC
-            2) full path of a function in some different module,
+        ANALYZE can be:
+            (a) name of a function in same module as FUNC
+            (b) full path of a function in some different module,
                 e.g.: foo2.analyze
-            3) name of a method of the class specified by FUNC.
+            (c) name of a method of the class specified by FUNC
         '''))
     parser.add_argument('-d', '--directory', action='store', default=None,
         help=textwrap.dedent(
@@ -252,7 +249,7 @@ def main():
         help=textwrap.dedent(
         '''\
         Copy directory COPY to the entry's output directory. 
-        (By default,  FUNC is run in a clean working directory)
+        (By default, FUNC is run in a clean working directory)
         If COPY is not specified (but -c is), then the 
         current working directory is used.
         '''))
@@ -262,7 +259,7 @@ def main():
         Use if GNU's `screen` executable is missing or broken. 
         '''
         ))
-    parser.add_argument('-ls',action='store_true',
+    parser.add_argument('-ls','--ls',action='store_true',
         help=textwrap.dedent(
         '''\
         Show running scilog screens
@@ -296,9 +293,6 @@ def main():
         elif args.r:
             import subprocess
             screens = [screen for screen in get_screens() if args.r in screen]
-            #print(args.r, get_screens())
-            #import sys
-            #sys.exit()
             if len(screens)==1:
                 subprocess.run(['screen','-r',screens[0]],env = get_screen_env())
             elif len(screens)==0:
@@ -317,10 +311,27 @@ def main():
     import traceback
     import warnings
     import importlib
+    import os
+    import textwrap
+    import shutil
     from scilog import scilog
-    STR_ENTRY = lambda entry: ('=' * 80+'\nEntry \'{}\' at {}:\n'.format(entry['name'], entry['path'])
-                + '=' * 80 + '\n' + json.dumps({key:value for key,value in entry.items() if key != 'modules'}, sort_keys=True, indent=4, default=str)[1:-1])
-    STR_MULTI_ENTRIES = lambda n:f'Found {n} entries'
+    def STR_ENTRY(entry):
+        terminal_size = shutil.get_terminal_size((80,20))
+        len_boundary = terminal_size.columns
+        string_title = 'Entry \'{}\' at {}'.format(entry['name'], os.path.relpath(entry['path'],os.getcwd()))
+        string_title = textwrap.wrap(string_title,len_boundary-2)
+        string_boundary = '='*len_boundary
+        if len(string_title)==1:
+            pad = (len_boundary-len(string_title[0]))//2
+        else:
+            pad = 0
+        return string_boundary+'\n'+' '*pad+'\n'.join(string_title)+'\n'+string_boundary+'\n'+json.dumps(
+            {key:value for key,value in entry.items() if key != 'modules'},
+            sort_keys=True, indent=4, default=str
+        )[1:-1]
+    #STR_ENTRY = lambda entry: ('=' * 80+'\nEntry \'{}\' at {}:\n'.format(entry['name'], os.path.relpath(entry['path'],os.getcwd()))
+    #            + '=' * 80 + '\n' + json.dumps({key:value for key,value in entry.items() if key != 'modules'}, sort_keys=True, indent=4, default=str)[1:-1])
+    STR_MULTI_ENTRIES = lambda pattern,n:f'Found {n} entries matching \'{pattern}\'' if n>0 else f'There is no scilog entry matching \'{pattern}\''
     #MSG_ENTER_SCREEN = lambda session_name: f'Opening scilog screen {session_name}'
     MSG_START_SCREEN = 'To detach from scilog screen, press `Ctrl+A`, then `D`'
     STR_GITDIFF = '\n The current working directory differs from the git repository at the time of the scilog entry as follows:'
@@ -331,7 +342,7 @@ def main():
             entries = scilog.load(search_pattern=args.func, no_objects=True, need_unique=False)
             entries = list(entries)
             if len(entries) != 1:
-                print(STR_MULTI_ENTRIES(len(entries)))
+                print(STR_MULTI_ENTRIES(args.func,len(entries)))
             for entry in entries:
                 print(STR_ENTRY(entry))
                 if not args.nogit and entry['gitcommit']:
