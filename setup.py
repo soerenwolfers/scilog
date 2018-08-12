@@ -25,6 +25,7 @@ class PostInstallCommand(install):
 setup(
     name='scilog',
     version='1.6',
+    url = 'https://bitbucket.org/soerenwolfers/scilog',
     python_requires='>=3',
     long_description=open('README.rst').read(),
     description='Keep track of numerical experiments',

@@ -195,10 +195,10 @@ LEN_ID = 8
 #TODO understand ellipses in variable input: Do this at the string input level, so 2**3,...,2**6 can be understood. 
 #TODO check after each experiment that git has not changed
 #TODO if all experiments fail, delete git commit
-def record(func, variables=None, name=None, directory=None, aux_data=None,
+def record(func, variables=None, name=None, base_directory=None, aux_data=None,
             analysis=None, runtime_profile=False, memory_profile=False,
             git=True, no_date=False, parallel=False,
-            copy_output = None, parameters=None,debug = None,classification= None):
+            copy_output = None, parameters=None,debug = None,classification= None,dry_run=False):
     '''
     Call :code:`func` once or multiple times and store results along with auxiliary information
     about runtime and memory usage, installed modules, source code, hardware, etc.
@@ -260,8 +260,8 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
     :param name: Name of scilog entry. 
         If not specified, :code:`func.__name__` is used
     :type name: String
-    :param directory: Root directory for storage
-    :type directory: String
+    :param base_directory: Root directory for storage
+    :type base_directory: String
     :param aux_data: Auxiliary data that should be stored along with the results
     :type aux_data: Any
     :param analysis: Function that is called after each experiment 
@@ -291,11 +291,17 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
     :type copy_output: String
     :param classification: Short, human readable description of entry
     :type classification: String
+    :param dry_run: Only setup directory and experiments, don't execute anything
+    :type dry_run: Boolean
     :return: Path of scilog entry
     :rtype: String
     '''
     ########################### FIX ARGUMENTS ###########################
+    variables,parameters,func_initialized,classification_t = _setup_experiments(variables,parameters,func)
+    classification = classification or classification_t
     name = name or _get_name(func)
+    if dry_run:
+        return variables,parameters,classification,name
     external = _external(func)
     debug = debug if debug is not None else aux.isdebugging()
     if debug: 
@@ -307,8 +313,7 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
             if not _has_git(git):
                 log_nogit = True
                 git = False
-    variables,parameters,func_initialized,classification_t = _setup_experiments(variables,parameters,func)
-    classification = classification or classification_t
+    ########################### SETUP INPUTS ##############################
     if len(variables)!=1:#Will result in infinite loop if one variable is infinite. 
         t = itertools.product(*[variable[1] for variable in variables])
     else:
@@ -318,19 +323,19 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
         n_experiments = int(np.prod([len(variable[1]) for variable in variables]))
     except TypeError:
         n_experiments = None
-    ########################### CREATE SCILOG ENTRY ###########################
-    directory,ID = _get_directory(directory,func,name,no_date,debug,git,classification)
-    log_file = os.path.join(directory, FILE_LOG)
-    err_file = os.path.join(directory, FILE_ERR)
-    info_file = os.path.join(directory, FILE_INFO)
-    load_file = os.path.join(directory, FILE_LOAD)
-    aux_data_file = os.path.join(directory, FILE_AUX)
-    source_file_name = os.path.join(directory, FILE_SOURCE)
-    git_file = os.path.join(directory, FILE_GITLOG)
+    ########################### CREATE SCILOG ENTRY ########################
+    entry_directory,ID = _get_directory(base_directory,func,name,no_date,debug,git,classification)
+    log_file = os.path.join(entry_directory, FILE_LOG)
+    err_file = os.path.join(entry_directory, FILE_ERR)
+    info_file = os.path.join(entry_directory, FILE_INFO)
+    load_file = os.path.join(entry_directory, FILE_LOAD)
+    aux_data_file = os.path.join(entry_directory, FILE_AUX)
+    source_file_name = os.path.join(entry_directory, FILE_SOURCE)
+    git_file = os.path.join(entry_directory, FILE_GITLOG)
     locker = Locker()
     _log = Log(write_filter=True, print_filter=True, file_name=log_file,lock = locker.get_lock())  # Logging strategy: 1) Redirect out and err of user functions (analysis and experiment) to their own files
     _err = Log(write_filter=True, print_filter=False, file_name=err_file,lock = locker.get_lock())  # 2) Log errors outside user functions in _err 3) Log everything (user-err and _err, as well as other info) in _log 
-    _log.log(MSG_START_ENTRY(directory))
+    _log.log(MSG_START_ENTRY(entry_directory))
     if log_nogit:
         _log.log(group = GRP_WARN,message = MSG_NOGIT)
     if debug:
@@ -384,7 +389,7 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
         try:
             _log.log(message=MSG_START_GIT(os.path.basename(os.path.normpath(git))))
             with (capture_output() if not debug else no_context()) as c:
-                snapshot_id, git_log, _ = _git_snapshot(path=git,commit_body=STR_GIT_COMMIT_BODY(name, ID, directory), ID=ID)
+                snapshot_id, git_log, _ = _git_snapshot(path=git,commit_body=STR_GIT_COMMIT_BODY(name, ID, entry_directory), ID=ID)
             append_text(git_file, STR_GIT_LOG(snapshot_id, git_log))
             _log.log(message=MSG_FINISH_GIT(snapshot_id))
             info['gitcommit'] = snapshot_id
@@ -417,7 +422,7 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
     ########################### RUN EXPERIMENTS ###############################
     args = (
         (
-            i, input, directory, func_initialized, memory_profile,
+            i, input, entry_directory, func_initialized, memory_profile,
             runtime_profile, _log,_err,
             'pickle' if serializer == pickle else 'dill',
             external, debug, copy_output,n_experiments
@@ -432,7 +437,7 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
             pass
         success = all(s=='finished' for s in info['experiments']['status'])
         try:
-            _log.log(MSG_FINISH_ENTRY(directory))
+            _log.log(MSG_FINISH_ENTRY(entry_directory))
             if not success:
                 _log.log(MSG_FAIL)
         except Exception:
@@ -441,7 +446,7 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
         if note:
             info['note'] = note
             store_info()
-        return directory
+        return entry_directory
     if parallel and not debug:
         try:
             from pathos.multiprocessing import ProcessingPool as Pool
@@ -477,12 +482,12 @@ def record(func, variables=None, name=None, directory=None, aux_data=None,
                     sys.exit(1)
                 try:
                     with capture_output():
-                        entry = load(path=directory, need_unique=True, no_objects=False)
+                        entry = load(path=entry_directory, need_unique=True, no_objects=False)
                     analyze(func=analysis, entry=entry, _log=_log, _err=_err, debug=debug)
                 except Exception:
                     _err.log(message=traceback.format_exc())
                     _log.log(group=GRP_ERROR, message=MSG_EXCEPTION_ANALYSIS)
-    close_entry()
+    return close_entry()
 
 def _has_git(git):
     cwd = os.getcwd()

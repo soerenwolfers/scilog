@@ -44,12 +44,12 @@ def main():
             import subprocess
             screen_out = subprocess.run(['screen','-ls'],stdout=subprocess.PIPE,env = get_screen_env()).stdout
             screen_lines = screen_out.splitlines()[1:-1]
-            screen_re = re.compile('(.*?)\((.*?)\).*?\((.*?)\)')
+            screen_re = re.compile('(.*?)(\(.*?\)).*?(\(.*?\))')
             screens = []
             for screen in screen_lines:
                 match=screen_re.match(screen.decode('UTF8'))
                 if match:
-                    screens.append(screen.decode('UTF8'))
+                    screens.append([group.strip().replace('\t','') for group in match.groups()])
             return screens
         else:
             import os
@@ -272,13 +272,21 @@ def main():
         '''
         )).completer=ScreenCompleter
     parser.add_argument('--withinscreen',action='store_true',help=argparse.SUPPRESS)#Same effect as noscreen, but signalizes knowledge that you work within screen (which is used in console output to let user know how to exit screen and to keep screen session running after errors until user explicitly ends it)
-    #argcomplete.CompletionFinder(parser,append_space = False)
     argcomplete.autocomplete(parser,append_space = False)
     args = parser.parse_args()
-    #args.parameters = ''.join(args.parameters) if (',' in p[-1] for p in args.parameters) else ','.join(args.parameters)
+    # All of the above needs to be fast for the CLI to run smoothly -> imports come only now
+    import json
+    import sys
+    import subprocess
+    import traceback
+    import os
+    import textwrap
+    import shutil
     args.func = ' '.join(args.func)
+    def print_indent(ls):
+        col = shutil.get_terminal_size((80,20)).columns
+        [print(' * '+'\n    '.join(textwrap.wrap(l.strip().replace('\t','    '),col-8))) for l in ls] 
     def get_screen_env():
-        import os
         my_env = os.environ.copy()
         my_env['SCREENDIR'] = SCREEN_DIR_PREFIX+os.getlogin()
         return my_env
@@ -287,37 +295,23 @@ def main():
             screens = get_screens(extensive=True)
             if screens:
                 print('Open scilog screens:')
-                [print(screen) for screen in screens]
+                print_indent(' '.join(screen) for screen in screens)
             else:
                 print('No open scilog screens')
         elif args.r:
-            import subprocess
-            screens = [screen for screen in get_screens() if args.r in screen]
+            screens = [screen for screen in get_screens(extensive = True) if args.r in screen[0]]
             if len(screens)==1:
-                subprocess.run(['screen','-r',screens[0]],env = get_screen_env())
+                subprocess.run(['screen','-r',screens[0][0]],env = get_screen_env())
             elif len(screens)==0:
                 print(f'There is no scilog screen to be resumed matching {args.r}')
-            else:
+            elif len(screens)>1:
                 print(f'There are multiple scilog screens to be resumed matching {args.r}:')
-                print('\t'+'\n\t'.join(screens))
+                print_indent(' '.join(screen) for screen in screens)
         else:
             parser.print_help()
-        import sys
         sys.exit()
-    # All of the above needs to be fast for the CLI to run smoothly -> imports come only now
-    import json
-    import sys
-    import subprocess
-    import traceback
-    import warnings
-    import importlib
-    import os
-    import textwrap
-    import shutil
-    from scilog import scilog
     def STR_ENTRY(entry):
-        terminal_size = shutil.get_terminal_size((80,20))
-        len_boundary = terminal_size.columns
+        len_boundary = shutil.get_terminal_size((80,20)).columns
         string_title = 'Entry \'{}\' at {}'.format(entry['name'], os.path.relpath(entry['path'],os.getcwd()))
         string_title = textwrap.wrap(string_title,len_boundary-2)
         string_boundary = '='*len_boundary
@@ -338,6 +332,7 @@ def main():
     MSG_ERROR_SCREEN = 'Make sure GNU screen is installed on your system. Alternatively, try `--noscreen`'
     success = False
     try:
+        from scilog import scilog#is slow, so only import once needed
         if args.show:
             entries = scilog.load(search_pattern=args.func, no_objects=True, need_unique=False)
             entries = list(entries)
@@ -352,88 +347,34 @@ def main():
                     except subprocess.CalledProcessError:
                         pass
         else:
-            if args.variables is  None:
-                variables = None
-            elif args.variables == '{}':
-                variables = {}
-            else:
-                variables = scilog._evaluator(args.variables)
-            if args.parameters is None:
-                parameters = None
-            elif args.parameters == '{}':
-                parameters = {}
-            else:
-                parameters = scilog._evaluator(args.parameters)
-            python_function_s = re.compile('\s*(\w+(?:\.|:))+(\w+)(\(.*\))?\s*$')#re.compile('(\w+\.)+(\w+)(\(*\))?')
-            python_function_match = python_function_s.match(args.func)
-            external = args.external or not python_function_match 
-            if not external:#Assume args.func describes a Python class or function
-                not_module = False #Do not treat args.func as if it was only a module without callable name
-                if python_function_match.group(3):#Variables specified in Python-syntax
-                    not_module = True
-                    if args.parameters or args.variables:
-                        raise ValueError('Parameters or variables specified more than once')
-                    args.func = args.func.split('(')[0]
-                    vars_and_pars = scilog._evaluator(python_function_match.group(3)[1:-1],{'var':scilog._var})
-                    variables = {key:value.obj for key,value  in vars_and_pars.items() if isinstance(value,scilog._var)}
-                    parameters ={key:value for key,value in vars_and_pars.items() if not isinstance(value,scilog._var)}
-                args.func = args.func.replace(':','.')#At this point only a module name is left, in which there are certainly no legal colons left except those that ended up there because of autocompletion
-                try:#Assume that args.func is a module path containing class or function of same name
-                    if not_module:#Skip to below
-                        raise ImportError
-                    module = importlib.import_module(args.func)
-                except ImportError:#Assume that args.func is module path plus trailing function or class name
-                    module_name = '.'.join(args.func.split('.')[:-1])
-                    module = importlib.import_module(module_name)
-                try: #Assume class is last part of args.func argument
-                    class_or_function_name = args.func.split('.')[-1]
-                    func = getattr(module, class_or_function_name)
-                except AttributeError :  # Or maybe last part but capitalized?
-                    class_or_function_name2 = class_or_function_name.title()
-                    try:
-                        func = getattr(module, class_or_function_name2)
-                    except AttributeError:
-                        raise ValueError(f'`{class_or_function_name}` is not a callable or class in module `{module.__name__}` at {module.__file__}') from None
-            else:#Assume the module describes an external call
-                python_incomplete_function_s = re.compile('\s*(\w+)\(.*\)\s*$')#TODO:warn about externals that look like python calls with forgotten module
-                python_incomplete_function_match =  python_incomplete_function_s.match(args.func)
-                if python_incomplete_function_match:
-                    raise ValueError(f'Did you forget to specify a module for Python function `{python_incomplete_function_match.group(1)}`?')
-                func = args.func
-            if args.analyze:
-                try:
-                    split_analyze = args.analyze.split('.')
-                    try:
-                        if len(split_analyze) > 1:  # Analyze function in different module
-                            analyze_module = importlib.import_module('.'.join(split_analyze[:-1]))
-                        else:
-                            analyze_module = module
-                        analyze_fn = getattr(analyze_module, split_analyze[-1])
-                    except AttributeError:  # is analyze maybe a function of class instance?
-                        analyze_fn = getattr(func, args.analyze)
-                except Exception:
-                    analyze_fn = None
-                    traceback.print_exc()
-                    warnings.warn(scilog.MSG_ERROR_LOAD('function {}'.format(args.analyze)))
-            else:
-                analyze_fn = None
+            variables,parameters,func,analyze_fn = parse_scilog_args(args.variables,args.parameters,args.func,args.external,args.analyze)
             if not args.noscreen and not args.withinscreen:
                 try:
                     scilog._patch_screenrc()
                 except Exception:
                     pass 
-                variables,parameters,_,classification_t = scilog._setup_experiments(variables,parameters,func)
-                args.classification = args.classification or classification_t
-                session_name = (args.name or scilog._get_name(func))+'.'+args.classification
+                variables,parameters,args.classification,args.name = scilog.record(
+                    variables = variables,
+                    parameters = parameters,
+                    func = func,
+                    name = args.name,
+                    git = not args.nogit,
+                    no_date = args.nodate,
+                    base_directory = args.directory,
+                    debug = args.debug,
+                    dry_run = True,
+                    classification = args.classification
+                )
+                session_name = '.'.join([args.name]+([args.classification] if args.classification else []))
                 argumenter = lambda d: (', '.join(f'{key}={repr(value)}' for key,value in d.items())) if d else '{}'
                 remaining_argv=[]
                 if parameters:
                     remaining_argv
                 remaining_argv = [
-                    '--parameters',argumenter(parameters),
-                    '--variables',argumenter(dict(variables)),
+                    '--parameters',argumenter(parameters),#Cant use args.parameters because that might be empty (because parameters can be passed in parentheses syntax)
+                    '--variables',argumenter(dict(variables)),#Cant use args.variables because that might be empty (because variables can be passed in parentheses syntax)
                     '--withinscreen',
-                    '--classification',args.classification
+                    '--classification',args.classification,
                 ]
                 for key,value in args.__dict__.items():
                     if key not in ['func','parameters','variables','withinscreen','classification']:
@@ -454,7 +395,7 @@ def main():
                     print(MSG_START_SCREEN)
                 success = scilog.record(
                     func=func, 
-                    directory=args.directory,
+                    base_directory=args.directory,
                     variables=variables,
                     name=args.name,
                     analysis=analyze_fn,
@@ -466,12 +407,85 @@ def main():
                     copy_output=args.copy,
                     debug = args.debug,
                     parameters=parameters,
-                    classification = args.classification
+                    classification = args.classification,
                 )
     except:#this try-except is needed in particular within screen: screen session terminates as soon as the inner scilog run ends, so the inner scilog sesssion must not end
         traceback.print_exc()
     if args.withinscreen and success is False:
         input('Press Enter to exit')
+
+def parse_scilog_args(args_variables,args_parameters,args_func,args_external,args_analyze):
+    import scilog
+    import re
+    import warnings
+    import traceback
+    import importlib
+    if args_variables is  None:
+        variables = None
+    elif args_variables == '{}':
+        variables = {}
+    else:
+        variables = scilog._evaluator(args_variables)
+    if args_parameters is None:
+        parameters = None
+    elif args_parameters == '{}':
+        parameters = {}
+    else:
+        parameters = scilog._evaluator(args_parameters)
+    python_function_s = re.compile('\s*(\w+(?:\.|:))+(\w+)(\(.*\))?\s*$')#re.compile('(\w+\.)+(\w+)(\(*\))?')
+    python_function_match = python_function_s.match(args_func)
+    external = args_external or not python_function_match 
+    if not external:#Assume args_func describes a Python class or function
+        not_module = False #Do not treat args_func as if it was only a module without callable name
+        if python_function_match.group(3):#Variables specified in Python-syntax
+            not_module = True
+            if args_parameters or args_variables:
+                raise ValueError('Parameters or variables specified more than once')
+            args_func = args_func.split('(')[0]
+            vars_and_pars = scilog._evaluator(python_function_match.group(3)[1:-1],{'var':scilog._var})
+            variables = {key:value.obj for key,value  in vars_and_pars.items() if isinstance(value,scilog._var)}
+            parameters ={key:value for key,value in vars_and_pars.items() if not isinstance(value,scilog._var)}
+        args_func = args_func.replace(':','.')#At this point only a module name is left, in which there are certainly no legal colons left except those that ended up there because of autocompletion
+        try:#Assume that args_func is a module path containing class or function of same name
+            if not_module:#Skip to below
+                raise ImportError
+            module = importlib.import_module(args_func)
+        except ImportError:#Assume that args_func is module path plus trailing function or class name
+            module_name = '.'.join(args_func.split('.')[:-1])
+            module = importlib.import_module(module_name)
+        try: #Assume class is last part of args_func argument
+            class_or_function_name = args_func.split('.')[-1]
+            func = getattr(module, class_or_function_name)
+        except AttributeError :  # Or maybe last part but capitalized?
+            class_or_function_name2 = class_or_function_name.title()
+            try:
+                func = getattr(module, class_or_function_name2)
+            except AttributeError:
+                raise ValueError(f'`{class_or_function_name}` is not a callable or class in module `{module.__name__}` at {module.__file__}') from None
+    else:#Assume the module describes an external call
+        python_incomplete_function_s = re.compile('\s*(\w+)\(.*\)\s*$')#TODO:warn about externals that look like python calls with forgotten module
+        python_incomplete_function_match =  python_incomplete_function_s.match(args_func)
+        if python_incomplete_function_match:
+            raise ValueError(f'Did you forget to specify a module for Python function `{python_incomplete_function_match.group(1)}`?')
+        func = args_func
+    if args_analyze:
+        try:
+            split_analyze = args_analyze.split('.')
+            try:
+                if len(split_analyze) > 1:  # Analyze function in different module
+                    analyze_module = importlib.import_module('.'.join(split_analyze[:-1]))
+                else:
+                    analyze_module = module
+                analyze_fn = getattr(analyze_module, split_analyze[-1])
+            except AttributeError:  # is analyze maybe a function of class instance?
+                analyze_fn = getattr(func, args_analyze)
+        except Exception:
+            analyze_fn = None
+            traceback.print_exc()
+            warnings.warn(scilog.MSG_ERROR_LOAD('function {}'.format(args_analyze)))
+    else:
+        analyze_fn = None
+    return variables,parameters,func,analyze_fn
 
 if __name__=='__main__':
     main()
