@@ -24,11 +24,11 @@ class PostInstallCommand(install):
         install.run(self)
 setup(
     name='scilog',
-    version='1.6',
+    version='1.6.1',
     url = 'https://bitbucket.org/soerenwolfers/scilog',
-    python_requires='>=3',
+    python_requires='>=3.6',
     long_description=open('README.rst').read(),
-    description='Keep track of numerical experiments',
+    description='Effortless bookkeeping of numerical experiments',
     author='Soeren Wolfers',
     author_email='soeren.wolfers@gmail.com',
     packages=find_packages(exclude=['*tests']),#,'examples*']),
