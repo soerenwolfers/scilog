@@ -33,7 +33,7 @@ from matplotlib import pyplot
 from IPython.utils.capture import capture_output
 
 from swutil import sys_info, np_tools, plots, aux
-from swutil.validation import Positive, Integer, String, List, Tuple
+from swutil.validation import Positive, Integer, String, List, Tuple,Iterable
 from swutil.logs import Log
 from swutil.hpc import Locker
 from swutil.aux import  string_dialog, no_context, random_word,\
@@ -110,7 +110,7 @@ def STR_PARAMETERS_PROMPT(func,external,current_parameters,known_parameters,allo
                 why= f'to initialize class {name}'
             else:
                 why = f'to pass to {name}'
-    parameters_string = ', '.join(f'{key}={value}' for key,value in current_parameters.items())
+    parameters_string = ', '.join(f'{key}={value!r}' for key,value in current_parameters.items())
     require_parameters=[key for key in known_parameters if key not in current_parameters]
     if require_parameters:
         parameters_string += (', ' if parameters_string else '') + ', '.join(f'{key}=' for key in require_parameters)
@@ -193,8 +193,21 @@ LEN_ID = 8
 
 #TODO think about using inspect.formatargspec(inspect.getargspec(func)) to directly parse args and kwargs of user input even without named argument
 #TODO understand ellipses in variable input: Do this at the string input level, so 2**3,...,2**6 can be understood. 
-#TODO check after each experiment that git has not changed
-#TODO if all experiments fail, delete git commit
+#TODO make scilog --show work for all scilog entries in current git repo even outside of cwd
+#TODO make scilog --show smarter: if FUNC doesn't match any scilog entry path, try if it matches a scilog entry ID
+#TODO don't overwrite in analysis subdirectory, add new subsubdirectories. external programs can then also add those.
+#TODO remove analysis and add scilog --analyze working as follows: provide a list of entry identifiers (ID or paths) as well as a function that accepts scilog entries (i.e. the summary dicts). the source code file (foo.py) of that function (foo.func) is copied in the analysis subsubdirectories `foo_x` of each scilog entry  
+#TODO technically: `scilog --analyze X3DH,UH1X --parameters [...] --variables [...] foo.func` starts a scilog run with arguments func=foo.func, analysis = True[effects that git=False, base_directory =tempfile.mktemp(), func is  called  with parameters={**parameters, entries=[scilog.load(identifier) for identifier in analzsis]} log does not say 'created scilog entry' but instead says which entries will be analyzed with what, and finishes with "added analysis <classification_x to X3DH and <classification>_y to UH1X, and entry is copied into subdireoctry analyze/<classificatoin>_x of X3DH and UH1X with x possibly being adapted to what is already in the analysis of X3DH and UH1X ]
+#TODO make load ignore subdirectories of scilog entries (to avoid listing analysis entries)
+#TODO comunicate to plots.save 
+#TODO understand <param>=<string> without quotes around <string> (simple and stupid: fail, add unrecognized variable to locals, repeat...)
+#TODO understand scilog foo(a=1)(b=var()) by defining foo in locals() and have it return another function that takes yet more arguments 
+#TODO if copy_output is a path, try to copy that path and only terminate when succeeded (also, add argument check_done and if it is provided only try copying as soon as it returns True)
+#TODO store completion flag
+#TODO make scilog --show show [log, current-stdout,current-stderr] if entry not completed, (so you can avoid screen -r and navigation to the filesystem directory)
+#TODO make scilog --show show scilog-stderr if it exists and, if all experiments failed, also show current-stderr of last experiment (if at least one succeeded leave it to user to navigate to the failed experiment) 
+#TODO make scilog --show not show  gitdiff by default
+#TODO make scilog --show first look through screen sessions
 def record(func, variables=None, name=None, base_directory=None, aux_data=None,
             analysis=None, runtime_profile=False, memory_profile=False,
             git=True, no_date=False, parallel=False,
@@ -307,12 +320,12 @@ def record(func, variables=None, name=None, base_directory=None, aux_data=None,
     if debug: 
         git = False
     log_nogit = False
-    if git is True:
-        if not String.valid(git):
+    if git is not False:
+        if git is True:
             git = _get_func_directory(func)
-            if not _has_git(git):
-                log_nogit = True
-                git = False
+        if not _has_git(git):
+            log_nogit = True
+            git = False
     ########################### SETUP INPUTS ##############################
     if len(variables)!=1:#Will result in infinite loop if one variable is infinite. 
         t = itertools.product(*[variable[1] for variable in variables])
@@ -442,10 +455,11 @@ def record(func, variables=None, name=None, base_directory=None, aux_data=None,
                 _log.log(MSG_FAIL)
         except Exception:
             pass
-        note = input('You may add a short note to this entry or simply press Enter to exit:')        
-        if note:
-            info['note'] = note
-            store_info()
+        if not debug:
+            note = input('You may add a short note to this entry or simply press Enter to exit:')        
+            if note:
+                info['note'] = note
+                store_info()
         return entry_directory
     if parallel and not debug:
         try:
@@ -470,7 +484,7 @@ def record(func, variables=None, name=None, base_directory=None, aux_data=None,
         for arg in args:
             try:
                 output = _run_single_experiment(arg)
-            except Exception:
+            except Exception:#These come from errors in the code of _run_single_experiments. The user function errors are caught within there
                 _err.log(message=traceback.format_exc())
                 _log.log(group=GRP_ERROR, message=MSG_EXCEPTION_EXPERIMENT(arg[0]))
             else:
@@ -492,6 +506,7 @@ def record(func, variables=None, name=None, base_directory=None, aux_data=None,
 def _has_git(git):
     cwd = os.getcwd()
     try:
+        os.chdir(git)
         #subprocess.check_call(['git','status'],stdout = subprocess.PIPE,stderr=subprocess.PIPE)
         subprocess.check_call(['git','rev-parse','HEAD',],stdout = subprocess.PIPE,stderr=subprocess.PIPE)#Sometimes git status works but rev-parse, which is used later, fails; e.g. on repos without initial commit
         return True
@@ -530,18 +545,22 @@ def _get_name(func):
 
 def _evaluator(what,locals_dict = None):
     locals_dict = locals_dict or {}
-    return eval(f'(lambda **kwargs: kwargs)({what})',{'range':range,'count':itertools.count,'__builtins__':{}},locals_dict)
+    return eval(f'(lambda **kwargs: kwargs)({what})',{'range':range,'count':itertools.count,'np':np,'__builtins__':{}},locals_dict)
 
 class _var:
     def __init__(self,*obj):
         if len(obj)>1:#e.g. var('ab','cd','ef')
             self.obj = obj
         elif len(obj)==1:#e.g. var(range(3))
-            self.obj = obj[0]
+            if Iterable.valid(obj[0]):
+                self.obj = list(obj[0])#turn into list so that numpy arrays go through later on (if you leave them as arrays, they will make problems in = comparison, for example)
+            else:#Allows for --variables p=3 instead of --variables p=[3]
+                self.obj = [obj[0]]
         elif len(obj)==0:
             raise ValueError()
     def __repr__(self):
         return 'var('+repr(self.obj)+')'
+
 def _setup_experiments(variables,parameters,func):
     '''
     Note: input and output `variables` have iterator type, not _var. 
@@ -749,6 +768,11 @@ def _run_single_experiment(arg):
                             status = 'failed'
                             if debug:
                                 traceback.print_exc()
+                                try:
+                                    import ipdb as debugger
+                                except ModuleNotFoundError:
+                                    import pdb as debugger
+                                debugger.post_mortem(sys.exc_info()[2])
                             stderr_append = traceback.format_exc()
                         else:
                             status = 'finished'
@@ -1145,20 +1169,3 @@ def _git_snapshot(path, commit_body, ID):
         raise GitError(traceback.format_exc(), out)
     os.chdir(initial_directory)
     return snap_id, out, git_directory
-
-def _patch_screenrc():
-    '''
-    Prevent ending a screen session with Ctrl+D unless user has an opinion about that
-    '''
-    screenrc_path=os.path.join(str(pathlib.Path.home()),'.screenrc')
-    try:
-        with open(screenrc_path,'r') as fp:
-            screenrc = fp.readlines()
-    except FileNotFoundError:
-        screenrc=[]
-    for line in screenrc:
-        if 'setenv IGNOREEOF' in line:
-            break
-    else:
-        with open(screenrc_path,'a+') as fp:
-            fp.write('# added by scilog\nsetenv IGNOREEOF 5\n')

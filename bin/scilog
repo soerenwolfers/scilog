@@ -1,421 +1,321 @@
 #!/usr/local/src/anaconda3/bin/python3
 # PYTHON_ARGCOMPLETE_OK
+import argparse
+import argcomplete
+import textwrap
+import os 
+import pkgutil
+import re
 SCREEN_DIR_PREFIX = f'/run/screen/scilog-'
-def main():
-    import argparse
-    import argcomplete
-    import textwrap
-    import pkgutil
-    import re
-    def _load_classes_and_functions(path):
-        with open(path,'r') as fp:
-            lines = fp.readlines()
-        class_or_function = re.compile('(class|def)\s+(\w+)[\(:]')
-        names = []
-        for line in lines:
-            match = class_or_function.match(line)
+def _load_classes_and_functions(path):
+    with open(path,'r') as fp:
+        lines = fp.readlines()
+    class_or_function = re.compile('(class|def)\s+(\w+)[\(:]')
+    names = []
+    for line in lines:
+        match = class_or_function.match(line)
+        if match:
+            names.append(match.group(2))
+    return names
+def PythonCompleter(**kwargs):
+    prefix = kwargs['prefix'].strip()
+    module_re = re.compile('\s*((?:\w+(?:\.|:))+)(\w*)$')
+    module_match = module_re.match(prefix)
+    if module_match:
+        head = module_match.group(1)
+        module_path = pkgutil.get_loader(head[:-1].replace(':','.')).path
+        tails = _load_classes_and_functions(module_path)
+        try:
+            path,filename= os.path.split(module_path)
+            if filename =='__init__.py':
+                for _,b,_ in pkgutil.walk_packages([path],
+                                onerror = lambda x:None):
+                    tails.append(b+':') 
+        except:
+            pass
+        finally:
+            return [head+tail for tail in tails]
+    else:
+        #return [dist.project_name.replace('Python', '') for dist in __import__('pkg_resources').working_set]
+        return [a.name+':' for a in pkgutil.iter_modules()]
+def get_screens(extensive = False):
+    if extensive:
+        import subprocess
+        screen_out = run_screen(['-ls'],{'stdout':subprocess.PIPE}).stdout
+        screen_lines = screen_out.splitlines()[1:-1]
+        screen_re = re.compile('(.*?)(\(.*?\)).*?(\(.*?\))')
+        screens = []
+        for screen in screen_lines:
+            match=screen_re.match(screen.decode('UTF8'))
             if match:
-                names.append(match.group(2))
-        return names
-    def PythonCompleter(**kwargs):
-        prefix = kwargs['prefix'].strip()
-        module_re = re.compile('\s*((?:\w+(?:\.|:))+)(\w*)$')
-        module_match = module_re.match(prefix)
-        if module_match:
-            import os
-            head = module_match.group(1)
-            module_path = pkgutil.get_loader(head[:-1].replace(':','.')).path
-            tails = _load_classes_and_functions(module_path)
-            try:
-                path,filename= os.path.split(module_path)
-                if filename =='__init__.py':
-                    for _,b,_ in pkgutil.walk_packages([path],
-                                    onerror = lambda x:None):
-                        tails.append(b+':') 
-            except:
-                pass
-            finally:
-                return [head+tail for tail in tails]
-        else:
-            #return [dist.project_name.replace('Python', '') for dist in __import__('pkg_resources').working_set]
-            return [a.name+':' for a in pkgutil.iter_modules()]
-    def get_screens(extensive = False):
-        if extensive:
-            import subprocess
-            screen_out = subprocess.run(['screen','-ls'],stdout=subprocess.PIPE,env = get_screen_env()).stdout
-            screen_lines = screen_out.splitlines()[1:-1]
-            screen_re = re.compile('(.*?)(\(.*?\)).*?(\(.*?\))')
-            screens = []
-            for screen in screen_lines:
-                match=screen_re.match(screen.decode('UTF8'))
-                if match:
-                    screens.append([group.strip().replace('\t','') for group in match.groups()])
-            return screens
-        else:
-            import os
-            screen_user_dir = SCREEN_DIR_PREFIX+os.getlogin()
-            screens = os.listdir(screen_user_dir)
-            return screens
-    def ScreenCompleter(**kwargs):
-        return get_screens()
-    parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter,
-        description=
-        textwrap.dedent(
-        '''\
-        Execute the command specified in '...' and store its output
-        along with auxiliary information about runtime and memory usage,
-        installed modules, source code, hardware, etc. in a directory
-        (referred to below as 'scilog entry') 
+                screens.append([group.strip().replace('\t','') for group in match.groups()])
+        return screens
+    else:
+        screen_user_dir = SCREEN_DIR_PREFIX+os.getlogin()
+        screens = os.listdir(screen_user_dir)
+        return screens
+def ScreenCompleter(**kwargs):
+    return get_screens()
+parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter,
+    description=
+    textwrap.dedent(
+    '''\
+    Execute the command specified in '...' and store its output
+    along with auxiliary information about runtime and memory usage,
+    installed modules, source code, hardware, etc. in a directory
+    (referred to below as 'scilog entry') 
 
-        Commands are executed in so-called 'screens', which survive when the opening 
-        terminal is closed and can be reopened later. 
+    Commands are executed in so-called 'screens', which survive when the opening 
+    terminal is closed and can be reopened later. 
 
-        Try it out:
-            $ scilog echo Hello world
-            (close terminal, wait a bit for completion of program, and reopen terminal)
-            $ scilog -r echo
-        (To list all running screens use `scilog -ls`)
+    Try it out:
+        $ scilog echo Hello world
+        (close terminal, wait a bit for completion of program, and reopen terminal)
+        $ scilog -r echo
+    (To list all running screens use `scilog -ls`)
 
-        More non-trivially, a numerical algorithm may be executed with 
-        different mesh resolutions to determine its rate of convergence:
-            $ scilog 'my_module.my_algorithm(h=var([2**(-n) for n in range(5)]))'
-        (Each call of the executable is called an 'experiment' below)
+    More realistically, a numerical algorithm may be executed with 
+    different mesh resolutions to determine its rate of convergence:
+        $ scilog 'my_module.my_algorithm(h=var([2**(-n) for n in range(5)]))'
+    (Each call of the executable is called an 'experiment' below)
 
-        Scilog entries consist of the following files and subdirectories:
-            *summary.txt:
-                *name: Name of scilog entry
-                *ID: Alphanumeric 8 character string identifying the entry
-                *modules: Module versions
-                *time: Time of execution
-                *experiments: For each experiment
-                    *string representation of input
-                    *string representation of output
-                    *runtime
-                    *status
-                    *(optional)peak memory usage
-            *log.txt
-            *(optional)err.txt
-            *(optional)git.txt -- stdout of git snapshot creation 
-            *source.txt -- Source code of containing Python module 
-                            (for Python functions and class instances)
-            *For each experiment a subdirectory 'experiment<i>/' with:
-                *output.pkl -- Output object 
-                            (for Python function calls)
-                *(optional)input.pkl -- Input arguments
-                            (for Python function calls)
-                *(optional) working_directory/ -- Working directory
-                *(optional)stderr.txt
-                *(optional)stdout.txt
-                *(optional)runtime_profile.txt -- Extensive runtime information
-                *(optional)memory_profile.txt -- Memory usage information
-            *(optional) analysis/ -- output of ANALYZE
-                *(optional)stderr.txt
-                *(optional)stdout.txt
-                *(optional)working_directory/ -- Working directory for call of ANALYZE
+    Scilog entries consist of the following files and subdirectories:
+        *summary.txt:
+            *name: Name of scilog entry
+            *ID: Alphanumeric 8 character string identifying the entry
+            *modules: Module versions
+            *time: Time of execution
+            *experiments: For each experiment
+                *string representation of input
+                *string representation of output
+                *runtime
+                *status
+                *(optional)peak memory usage
+        *log.txt
+        *(optional)err.txt
+        *(optional)git.txt -- stdout of git snapshot creation 
+        *source.txt -- Source code of containing Python module 
+                        (for Python functions and class instances)
+        *For each experiment a subdirectory 'experiment<i>/' with:
+            *output.pkl -- Output object 
+                        (for Python function calls)
+            *(optional)input.pkl -- Input arguments
+                        (for Python function calls)
+            *(optional) working_directory/ -- Working directory
+            *(optional)stderr.txt
+            *(optional)stdout.txt
+            *(optional)runtime_profile.txt -- Extensive runtime information
+            *(optional)memory_profile.txt -- Memory usage information
+        *(optional) analysis/ -- output of ANALYZE
+            *(optional)stderr.txt
+            *(optional)stdout.txt
+            *(optional)working_directory/ -- Working directory for call of ANALYZE
 
-        To display information about an existing scilog entry in the command line,
-        use `scilog --show ...`
+    To display information about an existing scilog entry in the command line,
+    use `scilog --show ...`
 
-        Usage syntax:
-        (a) Python callables:  
-            To call the function `foo` in module `bar` with all entries 
-            of `range(4)` in the first argument and `42` in the second, run:
-                $ scilog 'foo.bar(a=var(range(4)),b=42)'
-            (Quotes prevent interpretation of parentheses as subshell)
-            (Positional arguments are not supported, argument names must be specified)
-            If scilog is instead called with 
-                $ scilog foo.bar
-            then arguments will be asked for in an interactive command line interface.  
-        (b) Shell command strings:
-            Placeholders in the command string can be specified by braces and variable 
-            ranges can be specified with the command line argument VARIABLES. 
-            For example, try:
-                $ scilog --variables 'arg=range(3)' echo {arg} 
-            If there are further parameters that don't have to be varied but should be 
-            recorded in the log entry, they may be specified with PARAMETERS. 
-                $ scilog --variables 'a=["f","m"]' --parameters b="oo" echo {a}{b} 
-            Example: To prevent scilog form interpreting braces as variable indicators: 
-                $ scilog --parameters 'arg="{42}"' echo {arg}
-                (Single quotes prevent interpretation of double quotes by the shell
-                 and allow them to be interpreted as Python string delimiters instead)
-        (c) Python classes:
-            The specified class is instantiated and all calls are made to instance.
-            Parameters for ininitialization of the class can be specified in PARAMETERS. 
-            Variables for calls of the instance can be specified in VARIABLES. 
-            Alternatively, both instance parameters and call variables
-            can be chosen in an interactive command line interface. 
-        '''))
-    parser.add_argument('func', metavar='...',action='store',nargs = argparse.REMAINDER,
-        help=textwrap.dedent(
-        '''\
-        Shell command string or Python function/class 
-        (referred to below as FUNC)
-        ''')).completer = PythonCompleter
-    parser.add_argument('-v', '--variables', action='store', default=None,
-        help=textwrap.dedent(
-        '''\
-        Name-value pairs of variables and their range.
-        Use Python keyword argument style.
-        For example, "--variables N=range(10),M=[1.2,4.3]" 
-        will result in 20=10*2 experiments.  
-        '''))
-    parser.add_argument('-p', '--parameters', action='store', default=None,
-        help=textwrap.dedent(
-        '''\
-        Parameters that are equal for all experiments.
-        (keyword argument style; either quotes or no spaces).
-        If FUNC is Python function, PARAMETERS and VARIABLES
-        are passed in form of keyword arguments to FUNC.
-        If FUNC is Python class, the class is initialized
-        with PARAMETERS as keyword arguments.
-        If argument FUNC is a bash command string, PARAMETERS
-        are used to fill braces not specified by VARIABLES. 
-        For example
-            $ scilog "my_func {a} -d {b}" -v a=[0,1] -p b=True 
-        results in the following commands to be executed:
-            1) my_func 0 -d True
-            2) my_func 1 -d True
-        '''))
-    parser.add_argument('-n', '--name', action='store', default=None,
-        help=textwrap.dedent(
-        '''\
-        Name of the scilog entry.
-        If not provided, name is derived from FUNC.
-        '''))
-    parser.add_argument('-a', '--analyze', action='store',
-        nargs='?', const='analyze', default=None,
-        help=textwrap.dedent(
-        '''\
-        Function that analyzes entry after each experiment.
-        ANALYZE can be:
-            (a) name of a function in same module as FUNC
-            (b) full path of a function in some different module,
-                e.g.: foo2.analyze
-            (c) name of a method of the class specified by FUNC
-        '''))
-    parser.add_argument('-d', '--directory', action='store', default=None,
-        help=textwrap.dedent(
-        '''\
-        Scilog base directory.
-        '''))
-    parser.add_argument('--parallel', action='store_true',
-        help=textwrap.dedent(
-        '''\
-        Perform experiments in parallel.
-        '''))
-    parser.add_argument('--profile', action='store_true',
-        help=textwrap.dedent(
-        '''\
-        Store memory and extensive runtime information.
-        (Total runtime of each experiment is always stored)
-        '''))
-    parser.add_argument('--nogit', action='store_true',
-        help=textwrap.dedent(
-        '''\
-        Do not create git snapshot commit.
-        By default, a commit is created for each scilog entry.
-        (Should you ever want get rid of the snapshots, use 
-        $ git tag --list 'scilog_*'|xargs -I %% git tag -d %% 
-        to remove all scilog commits or use Python function 
-        `clean_git_repository` to remove all scilog commits 
-        whose scilog entry is not in the repository anymore)
-        '''))
-    parser.add_argument('--nodate', action='store_true',
-        help=textwrap.dedent(
-        '''\
-        Do not store scilog entry in date based subdirectories.
-        '''))
-    parser.add_argument('--debug',action = 'store_true',
-        help=textwrap.dedent(
-        '''\
-        Run scilog in debug mode.
-        '''))
-    parser.add_argument('--external', action='store_true',
-        help=textwrap.dedent(
-        '''\
-        Specify that FUNC describes an external call.
-        Only needed when FUNC could be confused for a 
-        Python module, e.g., when FUNC=`foo.sh`.
-        '''))
-    parser.add_argument('-s', '--show', action='store_true',
-        help=textwrap.dedent(
-        '''\
-        Print information of entry/entries specified by '...'
-        (Shell-style wildcards, e.g. "foo*", are recognized.)
-        '''))
-    parser.add_argument('--classification',action = 'store',default = None,help = argparse.SUPPRESS)
-    parser.add_argument('-c', '--copy', action='store', nargs='?', const='.',
-        default=None,
-        help=textwrap.dedent(
-        '''\
-        Copy directory COPY to the entry's output directory. 
-        (By default, FUNC is run in a clean working directory)
-        If COPY is not specified (but -c is), then the 
-        current working directory is used.
-        '''))
-    parser.add_argument('--noscreen',action='store_true',
-        help=textwrap.dedent(
-        '''\
-        Use if GNU's `screen` executable is missing or broken. 
-        '''
-        ))
-    parser.add_argument('-ls','--ls',action='store_true',
-        help=textwrap.dedent(
-        '''\
-        Show running scilog screens
-        '''
-        ))
-    parser.add_argument('-r',action='store',default = None,metavar='SCREEN',
-        help=textwrap.dedent(
-        '''\
-        Attach to running scilog screen 
-        '''
-        )).completer=ScreenCompleter
-    parser.add_argument('--withinscreen',action='store_true',help=argparse.SUPPRESS)#Same effect as noscreen, but signalizes knowledge that you work within screen (which is used in console output to let user know how to exit screen and to keep screen session running after errors until user explicitly ends it)
-    argcomplete.autocomplete(parser,append_space = False)
-    args = parser.parse_args()
-    # All of the above needs to be fast for the CLI to run smoothly -> imports come only now
-    import json
-    import sys
-    import subprocess
-    import traceback
-    import os
-    import textwrap
-    import shutil
-    args.func = ' '.join(args.func)
-    def print_indent(ls):
-        col = shutil.get_terminal_size((80,20)).columns
-        [print(' * '+'\n    '.join(textwrap.wrap(l.strip().replace('\t','    '),col-8))) for l in ls] 
-    def get_screen_env():
-        my_env = os.environ.copy()
-        my_env['SCREENDIR'] = SCREEN_DIR_PREFIX+os.getlogin()
-        return my_env
-    if not args.func:
-        if args.ls:
-            screens = get_screens(extensive=True)
-            if screens:
-                print('Open scilog screens:')
-                print_indent(' '.join(screen) for screen in screens)
-            else:
-                print('No open scilog screens')
-        elif args.r:
-            screens = [screen for screen in get_screens(extensive = True) if args.r in screen[0]]
-            if len(screens)==1:
-                subprocess.run(['screen','-r',screens[0][0]],env = get_screen_env())
-            elif len(screens)==0:
-                print(f'There is no scilog screen to be resumed matching {args.r}')
-            elif len(screens)>1:
-                print(f'There are multiple scilog screens to be resumed matching {args.r}:')
-                print_indent(' '.join(screen) for screen in screens)
-        else:
-            parser.print_help()
-        sys.exit()
-    def STR_ENTRY(entry):
-        len_boundary = shutil.get_terminal_size((80,20)).columns
-        string_title = 'Entry \'{}\' at {}'.format(entry['name'], os.path.relpath(entry['path'],os.getcwd()))
-        string_title = textwrap.wrap(string_title,len_boundary-2)
-        string_boundary = '='*len_boundary
-        if len(string_title)==1:
-            pad = (len_boundary-len(string_title[0]))//2
-        else:
-            pad = 0
-        return string_boundary+'\n'+' '*pad+'\n'.join(string_title)+'\n'+string_boundary+'\n'+json.dumps(
-            {key:value for key,value in entry.items() if key != 'modules'},
-            sort_keys=True, indent=4, default=str
-        )[1:-1]
-    #STR_ENTRY = lambda entry: ('=' * 80+'\nEntry \'{}\' at {}:\n'.format(entry['name'], os.path.relpath(entry['path'],os.getcwd()))
-    #            + '=' * 80 + '\n' + json.dumps({key:value for key,value in entry.items() if key != 'modules'}, sort_keys=True, indent=4, default=str)[1:-1])
-    STR_MULTI_ENTRIES = lambda pattern,n:f'Found {n} entries matching \'{pattern}\'' if n>0 else f'There is no scilog entry matching \'{pattern}\''
-    #MSG_ENTER_SCREEN = lambda session_name: f'Opening scilog screen {session_name}'
-    MSG_START_SCREEN = 'To detach from scilog screen, press `Ctrl+A`, then `D`'
-    STR_GITDIFF = '\n The current working directory differs from the git repository at the time of the scilog entry as follows:'
-    MSG_ERROR_SCREEN = 'Make sure GNU screen is installed on your system. Alternatively, try `--noscreen`'
-    success = False
-    try:
-        from scilog import scilog#is slow, so only import once needed
-        if args.show:
-            entries = scilog.load(search_pattern=args.func, no_objects=True, need_unique=False)
-            entries = list(entries)
-            if len(entries) != 1:
-                print(STR_MULTI_ENTRIES(args.func,len(entries)))
-            for entry in entries:
-                print(STR_ENTRY(entry))
-                if not args.nogit and entry['gitcommit']:
-                    print(STR_GITDIFF)
-                    try:
-                        subprocess.call(['gitdiffuntracked', entry['gitcommit']])
-                    except subprocess.CalledProcessError:
-                        pass
-        else:
-            variables,parameters,func,analyze_fn = parse_scilog_args(args.variables,args.parameters,args.func,args.external,args.analyze)
-            if not args.noscreen and not args.withinscreen:
-                try:
-                    scilog._patch_screenrc()
-                except Exception:
-                    pass 
-                variables,parameters,args.classification,args.name = scilog.record(
-                    variables = variables,
-                    parameters = parameters,
-                    func = func,
-                    name = args.name,
-                    git = not args.nogit,
-                    no_date = args.nodate,
-                    base_directory = args.directory,
-                    debug = args.debug,
-                    dry_run = True,
-                    classification = args.classification
-                )
-                session_name = '.'.join([args.name]+([args.classification] if args.classification else []))
-                argumenter = lambda d: (', '.join(f'{key}={repr(value)}' for key,value in d.items())) if d else '{}'
-                remaining_argv=[]
-                if parameters:
-                    remaining_argv
-                remaining_argv = [
-                    '--parameters',argumenter(parameters),#Cant use args.parameters because that might be empty (because parameters can be passed in parentheses syntax)
-                    '--variables',argumenter(dict(variables)),#Cant use args.variables because that might be empty (because variables can be passed in parentheses syntax)
-                    '--withinscreen',
-                    '--classification',args.classification,
-                ]
-                for key,value in args.__dict__.items():
-                    if key not in ['func','parameters','variables','withinscreen','classification']:
-                        if isinstance(value,str):
-                            remaining_argv.extend(['--'+key,value])
-                        elif isinstance(value,bool):
-                            if value:
-                                remaining_argv.append('--'+key)
-                remaining_argv.append(args.func)
-                #print(MSG_ENTER_SCREEN(session_name))
-                try:
-                    subprocess.run(['screen','-S', session_name,sys.argv[0],*remaining_argv],env=get_screen_env())
-                    #sys.stdout.write('\033[F\033[K')
-                except FileNotFoundError:
-                    raise FileNotFoundError(MSG_ERROR_SCREEN) from None
-            else:
-                if args.withinscreen:
-                    print(MSG_START_SCREEN)
-                success = scilog.record(
-                    func=func, 
-                    base_directory=args.directory,
-                    variables=variables,
-                    name=args.name,
-                    analysis=analyze_fn,
-                    runtime_profile=args.profile,
-                    memory_profile=args.profile,
-                    git=not args.nogit,
-                    no_date=args.nodate,
-                    parallel=args.parallel,
-                    copy_output=args.copy,
-                    debug = args.debug,
-                    parameters=parameters,
-                    classification = args.classification,
-                )
-    except:#this try-except is needed in particular within screen: screen session terminates as soon as the inner scilog run ends, so the inner scilog sesssion must not end
-        traceback.print_exc()
-    if args.withinscreen and success is False:
-        input('Press Enter to exit')
-
+    Usage syntax:
+    (a) Python callables:  
+        To call the function `foo` in module `bar` with all entries 
+        of `range(4)` in the first argument and `42` in the second, run:
+            $ scilog 'foo.bar(a=var(range(4)),b=42)'
+        (Quotes prevent interpretation of parentheses as subshell)
+        (Positional arguments are not supported, argument names must be specified)
+        If scilog is instead called with 
+            $ scilog foo.bar
+        then arguments will be asked for in an interactive command line interface.  
+    (b) Shell command strings:
+        Placeholders in the command string can be specified by braces and variable 
+        ranges can be specified with the command line argument VARIABLES. 
+        For example, try:
+            $ scilog --variables 'arg=range(3)' echo {arg} 
+        If there are further parameters that don't have to be varied but should be 
+        recorded in the log entry, they may be specified with PARAMETERS. 
+            $ scilog --variables 'a=["f","m"]' --parameters b="oo" echo {a}{b} 
+        Example: To prevent scilog form interpreting braces as variable indicators: 
+            $ scilog --parameters 'arg="{42}"' echo {arg}
+            (Single quotes prevent interpretation of double quotes by the shell
+                and allow them to be interpreted as Python string delimiters instead)
+    (c) Python classes:
+        The specified class is instantiated and all calls are made to instance.
+        Parameters for ininitialization of the class can be specified in PARAMETERS. 
+        Variables for calls of the instance can be specified in VARIABLES. 
+        Alternatively, both instance parameters and call variables
+        can be chosen in an interactive command line interface. 
+    '''))
+parser.add_argument('func', metavar='...',action='store',nargs = argparse.REMAINDER,
+    help=textwrap.dedent(
+    '''\
+    Shell command string or Python function/class 
+    (referred to below as FUNC)
+    ''')).completer = PythonCompleter
+parser.add_argument('-v', '--variables', action='store', default=None,
+    help=textwrap.dedent(
+    '''\
+    Name-value pairs of variables and their range.
+    Use Python keyword argument style.
+    For example, "--variables N=range(10),M=[1.2,4.3]" 
+    will result in 20=10*2 experiments.  
+    '''))
+parser.add_argument('-p', '--parameters', action='store', default=None,
+    help=textwrap.dedent(
+    '''\
+    Parameters that are equal for all experiments.
+    (keyword argument style; either quotes or no spaces).
+    If FUNC is Python function, PARAMETERS and VARIABLES
+    are passed in form of keyword arguments to FUNC.
+    If FUNC is Python class, the class is initialized
+    with PARAMETERS as keyword arguments.
+    If argument FUNC is a bash command string, PARAMETERS
+    are used to fill braces not specified by VARIABLES. 
+    For example
+        $ scilog "my_func {a} -d {b}" -v a=[0,1] -p b=True 
+    results in the following commands to be executed:
+        1) my_func 0 -d True
+        2) my_func 1 -d True
+    '''))
+parser.add_argument('-n', '--name', action='store', default=None,
+    help=textwrap.dedent(
+    '''\
+    Name of the scilog entry.
+    If not provided, name is derived from FUNC.
+    '''))
+parser.add_argument('-a', '--analyze', action='store',
+    nargs='?', const='analyze', default=None,
+    help=textwrap.dedent(
+    '''\
+    Function that analyzes entry after each experiment.
+    ANALYZE can be:
+        (a) name of a function in same module as FUNC
+        (b) full path of a function in some different module,
+            e.g.: foo2.analyze
+        (c) name of a method of the class specified by FUNC
+    '''))
+parser.add_argument('-d', '--directory', action='store', default=None,
+    help=textwrap.dedent(
+    '''\
+    Scilog base directory.
+    '''))
+parser.add_argument('--parallel', action='store_true',
+    help=textwrap.dedent(
+    '''\
+    Perform experiments in parallel.
+    '''))
+parser.add_argument('--profile', action='store_true',
+    help=textwrap.dedent(
+    '''\
+    Store memory and extensive runtime information.
+    (Total runtime of each experiment is always stored)
+    '''))
+parser.add_argument('--nogit', action='store_true',
+    help=textwrap.dedent(
+    '''\
+    Do not create git snapshot commit.
+    By default, a commit is created for each scilog entry.
+    (Should you ever want get rid of the snapshots, use 
+    $ git tag --list 'scilog_*'|xargs -I %% git tag -d %% 
+    to remove all scilog commits or use Python function 
+    `clean_git_repository` to remove all scilog commits 
+    whose scilog entry is not in the repository anymore)
+    '''))
+parser.add_argument('--nodate', action='store_true',
+    help=textwrap.dedent(
+    '''\
+    Do not store scilog entry in date based subdirectories.
+    '''))
+parser.add_argument('--debug',action = 'store_true',
+    help=textwrap.dedent(
+    '''\
+    Run scilog in debug mode.
+    '''))
+parser.add_argument('--external', action='store_true',
+    help=textwrap.dedent(
+    '''\
+    Specify that FUNC describes an external call.
+    Only needed when FUNC could be confused for a 
+    Python module, e.g., when FUNC=`foo.sh`.
+    '''))
+parser.add_argument('-s', '--show', action='store_true',
+    help=textwrap.dedent(
+    '''\
+    Print information of entry/entries specified by '...'
+    (Shell-style wildcards, e.g. "foo*", are recognized.)
+    '''))
+parser.add_argument('--classification',action = 'store',default = None,help = argparse.SUPPRESS)
+parser.add_argument('-c', '--copy', action='store', nargs='?', const='.',
+    default=None,
+    help=textwrap.dedent(
+    '''\
+    Copy directory COPY to the entry's output directory. 
+    (By default, FUNC is run in a clean working directory)
+    If COPY is not specified (but -c is), then the 
+    current working directory is used.
+    '''))
+parser.add_argument('--noscreen',action='store_true',
+    help=textwrap.dedent(
+    '''\
+    Use if GNU's `screen` executable is missing or broken. 
+    '''
+    ))
+parser.add_argument('-ls','--ls',action='store_true',
+    help=textwrap.dedent(
+    '''\
+    Show scilog screens.
+    '''
+    ))
+parser.add_argument('-r',action='store',default = None,metavar='SCREEN',
+    help=textwrap.dedent(
+    '''\
+    Attach to scilog screen.
+    '''
+    )).completer = ScreenCompleter
+parser.add_argument('-x',action='store',default = None,metavar='SCREEN',
+    help=textwrap.dedent(
+    '''\
+    Attach to a not detached scilog screen. (Multi display mode).
+    '''
+    )).completer = ScreenCompleter
+parser.add_argument('--withinscreen',action='store_true',help=argparse.SUPPRESS)#Same effect as noscreen, but signalizes knowledge that you work within screen (which is used in console output to let user know how to exit screen and to keep screen session running after errors until user explicitly ends it)
+argcomplete.autocomplete(parser,append_space = False)
+args =  parser.parse_args()
+# All of the above needs to be fast for the CLI to run smoothly -> imports come only now
+import json
+import sys
+import subprocess
+import traceback
+import os
+import shutil
+import tempfile
+STR_MULTI_ENTRIES = lambda pattern,n:f'Found {n} entries matching \'{pattern}\'' if n>0 else f'There is no scilog entry matching \'{pattern}\''
+MSG_START_SCREEN = 'To detach from scilog screen, press `Ctrl+A`, then `D`'
+STR_GITDIFF = '\n The current working directory differs from the git repository at the time of the scilog entry as follows:'
+MSG_ERROR_SCREEN = 'Make sure GNU screen is installed on your system. Alternatively, try `--noscreen`'
+def STR_ENTRY(entry):
+    len_boundary = shutil.get_terminal_size((80,20)).columns
+    string_title = 'Entry \'{}\' at {}'.format(entry['name'], os.path.relpath(entry['path'],os.getcwd()))
+    string_title = textwrap.wrap(string_title,len_boundary-2)
+    string_boundary = '='*len_boundary
+    if len(string_title)==1:
+        pad = (len_boundary-len(string_title[0]))//2
+    else:
+        pad = 0
+    return string_boundary+'\n'+' '*pad+'\n'.join(string_title)+'\n'+string_boundary+'\n'+json.dumps(
+        {key:value for key,value in entry.items() if key != 'modules'},
+        sort_keys=True, indent=4, default=str
+    )[1:-1]
+def print_indent(ls):
+    col = shutil.get_terminal_size((80,20)).columns
+    [print(' * '+'\n    '.join(textwrap.wrap(l.strip().replace('\t','    '),col-8))) for l in ls] 
+def run_screen(command,subprocess_kwargs=None):
+    subprocess_kwargs = subprocess_kwargs or {}
+    my_env = os.environ.copy()
+    my_env['SCREENDIR'] = SCREEN_DIR_PREFIX+os.getlogin()
+    with tempfile.NamedTemporaryFile(mode='w+') as temp_file:
+        temp_file.write('setenv IGNOREEOF 5')# Probably unnecessary, to avoid screen closing by accident upon Ctrl-D
+        temp_file.flush()
+        return subprocess.run(['screen','-c',temp_file.name]+command,**subprocess_kwargs,env = my_env)
 def parse_scilog_args(args_variables,args_parameters,args_func,args_external,args_analyze):
-    import scilog
+    from scilog.scilog import _evaluator,_var,MSG_ERROR_LOAD
     import re
     import warnings
     import traceback
@@ -425,13 +325,13 @@ def parse_scilog_args(args_variables,args_parameters,args_func,args_external,arg
     elif args_variables == '{}':
         variables = {}
     else:
-        variables = scilog._evaluator(args_variables)
+        variables = _evaluator(args_variables)
     if args_parameters is None:
         parameters = None
     elif args_parameters == '{}':
         parameters = {}
     else:
-        parameters = scilog._evaluator(args_parameters)
+        parameters = _evaluator(args_parameters)
     python_function_s = re.compile('\s*(\w+(?:\.|:))+(\w+)(\(.*\))?\s*$')#re.compile('(\w+\.)+(\w+)(\(*\))?')
     python_function_match = python_function_s.match(args_func)
     external = args_external or not python_function_match 
@@ -442,9 +342,9 @@ def parse_scilog_args(args_variables,args_parameters,args_func,args_external,arg
             if args_parameters or args_variables:
                 raise ValueError('Parameters or variables specified more than once')
             args_func = args_func.split('(')[0]
-            vars_and_pars = scilog._evaluator(python_function_match.group(3)[1:-1],{'var':scilog._var})
-            variables = {key:value.obj for key,value  in vars_and_pars.items() if isinstance(value,scilog._var)}
-            parameters ={key:value for key,value in vars_and_pars.items() if not isinstance(value,scilog._var)}
+            vars_and_pars = _evaluator(python_function_match.group(3)[1:-1],{'var':_var})
+            variables = {key:value.obj for key,value  in vars_and_pars.items() if isinstance(value,_var)}
+            parameters ={key:value for key,value in vars_and_pars.items() if not isinstance(value,_var)}
         args_func = args_func.replace(':','.')#At this point only a module name is left, in which there are certainly no legal colons left except those that ended up there because of autocompletion
         try:#Assume that args_func is a module path containing class or function of same name
             if not_module:#Skip to below
@@ -482,10 +382,109 @@ def parse_scilog_args(args_variables,args_parameters,args_func,args_external,arg
         except Exception:
             analyze_fn = None
             traceback.print_exc()
-            warnings.warn(scilog.MSG_ERROR_LOAD('function {}'.format(args_analyze)))
+            warnings.warn(MSG_ERROR_LOAD('function {}'.format(args_analyze)))
     else:
         analyze_fn = None
     return variables,parameters,func,analyze_fn
-
-if __name__=='__main__':
-    main()
+args.func = ' '.join(args.func)
+if not args.func:
+    if args.ls:
+        screens = get_screens(extensive=True)
+        if screens:
+            print('Open scilog screens:')
+            print_indent(' '.join(screen) for screen in screens)
+        else:
+            print('No open scilog screens')
+    elif args.r or args.x:
+        screen_search = args.r or args.x
+        screens = [screen for screen in get_screens(extensive = True) if screen_search in screen[0]]
+        if len(screens)==1:
+            screen = screens[0]
+            if 'Detached' in screen[2] or args.x:
+                run_screen(['-x',screens[0][0]])
+            else:
+                print(f'The scilog screen matching {screen_search} is attached elsewhere')
+        elif len(screens)==0:
+            print(f'There is no scilog screen to be resumed matching {screen_search}')
+        elif len(screens)>1:
+            print(f'There are multiple scilog screens to be resumed matching {screen_search}:')
+            print_indent(' '.join(screen) for screen in screens)
+    else:
+        parser.print_help()
+    sys.exit()
+success = False
+try:
+    from scilog import scilog#is slow, so only import once needed
+    if args.show:
+        entries = scilog.load(search_pattern=args.func, no_objects=True, need_unique=False)
+        entries = list(entries)
+        if len(entries) != 1:
+            print(STR_MULTI_ENTRIES(args.func,len(entries)))
+        for entry in sorted(entries,key=lambda entry: entry['time']):
+            print(STR_ENTRY(entry))
+            if not args.nogit and entry['gitcommit']:
+                print(STR_GITDIFF)
+                try:
+                    subprocess.call(['gitdiffuntracked', entry['gitcommit']])
+                except subprocess.CalledProcessError:
+                    pass
+    else:
+        variables,parameters,func,analyze_fn = parse_scilog_args(args.variables,args.parameters,args.func,args.external,args.analyze)
+        if not args.noscreen and not args.withinscreen and not args.debug:
+            #with capture_output(): Cannot do this, because scilog.record asks for interaction if not all parameters have been specified. Even for instanation of func itself cannot capture because it might have its own user interface
+            variables,parameters,args.classification,args.name = scilog.record(#Dry run to complete parameters and get classification
+                variables = variables,
+                parameters = parameters,
+                func = func,
+                name = args.name,
+                git = not args.nogit,
+                no_date = args.nodate,
+                dry_run = True,
+                classification = args.classification
+            )
+            session_name = '.'.join([args.name]+([args.classification] if args.classification else []))
+            argumenter = lambda d: (', '.join(f'{key}={repr(value)}' for key,value in d.items())) if d else '{}'
+            remaining_argv=[]
+            if parameters:
+                remaining_argv
+            remaining_argv = [
+                '--parameters',argumenter(parameters),#Cant use args.parameters because that might be empty (because parameters can be passed in parentheses syntax)
+                '--variables',argumenter(dict(variables)),#Cant use args.variables because that might be empty (because variables can be passed in parentheses syntax)
+                '--withinscreen',
+                '--classification',args.classification,
+            ]
+            for key,value in args.__dict__.items():
+                if key not in ['func','parameters','variables','withinscreen','classification']:
+                    if isinstance(value,str):
+                        remaining_argv.extend(['--'+key,value])
+                    elif isinstance(value,bool):
+                        if value:
+                            remaining_argv.append('--'+key)
+            remaining_argv.append(args.func)
+            try:
+                run_screen(['-S',session_name,sys.argv[0],*remaining_argv])
+            except FileNotFoundError:
+                raise FileNotFoundError(MSG_ERROR_SCREEN) from None
+        else:
+            if args.withinscreen:
+                print(MSG_START_SCREEN)
+            success = scilog.record(
+                func=func, 
+                base_directory=args.directory,
+                variables=variables,
+                name=args.name,
+                analysis=analyze_fn,
+                runtime_profile=args.profile,
+                memory_profile=args.profile,
+                git=not args.nogit,
+                no_date=args.nodate,
+                parallel=args.parallel,
+                copy_output=args.copy,
+                debug = args.debug,
+                parameters=parameters,
+                classification = args.classification,
+            )
+except:#this try-except is needed in particular within screen: screen session terminates as soon as the inner scilog run ends, so the inner scilog sesssion must not end
+    traceback.print_exc()
+if args.withinscreen and success is False:
+    input('Press Enter to exit')
