@@ -6,7 +6,9 @@ import textwrap
 import os 
 import pkgutil
 import re
+
 SCREEN_DIR_PREFIX = f'/run/screen/scilog-'
+
 def _load_classes_and_functions(path):
     with open(path,'r') as fp:
         lines = fp.readlines()

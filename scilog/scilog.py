@@ -136,7 +136,7 @@ STR_PARAMETERS_HELP = lambda allow_variables: (
                                 ) if allow_variables else ''
                             )
                         )
-MSG_DEBUG =  'Running in debug mode. Entry is not stored permanently, stdout and stderr are not captured, no git commit is created'
+MSG_DEBUG =  'Debug mode. Entry is not stored permanently, stdout and stderr are not captured, no git commit is created'
 MSG_NOGIT = 'Could not find git repository. No snapshot commit will be created'
 MSG_START_ANALYSIS = 'Updating analysis'
 MSG_START_EXPERIMENT = lambda i,n_experiments,inp: (f'Running experiment {i}' + 
@@ -191,23 +191,26 @@ MSG_WARN_DILL = ('Could not find dill. Some items might not be storable. '
 MSG_INTERRUPT = f'Kill signal received. Stored {FILE_INFO}, closing now.'
 LEN_ID = 8
 
-#TODO think about using inspect.formatargspec(inspect.getargspec(func)) to directly parse args and kwargs of user input even without named argument
-#TODO understand ellipses in variable input: Do this at the string input level, so 2**3,...,2**6 can be understood. 
-#TODO make scilog --show work for all scilog entries in current git repo even outside of cwd
-#TODO make scilog --show smarter: if FUNC doesn't match any scilog entry path, try if it matches a scilog entry ID
-#TODO don't overwrite in analysis subdirectory, add new subsubdirectories. external programs can then also add those.
-#TODO remove analysis and add scilog --analyze working as follows: provide a list of entry identifiers (ID or paths) as well as a function that accepts scilog entries (i.e. the summary dicts). the source code file (foo.py) of that function (foo.func) is copied in the analysis subsubdirectories `foo_x` of each scilog entry  
+#TODO(low,high) think about using inspect.formatargspec(inspect.getargspec(func)) to directly parse args and kwargs of user input even without named argument
+#TODO(med,high) understand ellipses in variable input: Do this at the string input level, so 2**3,...,2**6 can be understood. 
+#TODO(med,low) make scilog --show work for all scilog entries in current git repo even outside of cwd
+#TODO(high,low) make scilog --show smarter: if FUNC doesn't match any scilog entry path, try if it matches a scilog entry ID
+#TODO(high,high) remove analysis functionality from scilog.py and add scilog --analyze working as follows: provide a list of entry identifiers (ID or paths) as well as a function that accepts scilog entries (i.e. the summary dicts). the source code file (foo.py) of that function (foo.func) is copied in the analysis subsubdirectories `foo_x` of each scilog entry  
 #TODO technically: `scilog --analyze X3DH,UH1X --parameters [...] --variables [...] foo.func` starts a scilog run with arguments func=foo.func, analysis = True[effects that git=False, base_directory =tempfile.mktemp(), func is  called  with parameters={**parameters, entries=[scilog.load(identifier) for identifier in analzsis]} log does not say 'created scilog entry' but instead says which entries will be analyzed with what, and finishes with "added analysis <classification_x to X3DH and <classification>_y to UH1X, and entry is copied into subdireoctry analyze/<classificatoin>_x of X3DH and UH1X with x possibly being adapted to what is already in the analysis of X3DH and UH1X ]
 #TODO make load ignore subdirectories of scilog entries (to avoid listing analysis entries)
-#TODO comunicate to plots.save 
-#TODO understand <param>=<string> without quotes around <string> (simple and stupid: fail, add unrecognized variable to locals, repeat...)
-#TODO understand scilog foo(a=1)(b=var()) by defining foo in locals() and have it return another function that takes yet more arguments 
-#TODO if copy_output is a path, try to copy that path and only terminate when succeeded (also, add argument check_done and if it is provided only try copying as soon as it returns True)
-#TODO store completion flag
-#TODO make scilog --show show [log, current-stdout,current-stderr] if entry not completed, (so you can avoid screen -r and navigation to the filesystem directory)
-#TODO make scilog --show show scilog-stderr if it exists and, if all experiments failed, also show current-stderr of last experiment (if at least one succeeded leave it to user to navigate to the failed experiment) 
-#TODO make scilog --show not show  gitdiff by default
-#TODO make scilog --show first look through screen sessions
+#TODO(?,?) comunicate to plots.save 
+#TODO(low,med) understand <param>=<string> without quotes around <string> (simple and stupid: fail, add unrecognized variable to locals, repeat...)
+#TODO(low,med) understand scilog foo(a=1)(b=var()) by defining foo in locals() and have it return another function that takes yet more arguments 
+#TODO(med,low) if copy_output is a path, try to copy that path and only terminate when succeeded (e.g. when it starts existing) also, add argument check_done and if it is provided only try copying as soon as it returns True
+#TODO(low,low) store completion flag
+#TODO(high,low) make scilog --show show [log, current-stdout,current-stderr] if entry not completed, (so you can avoid screen -r and navigation to the filesystem directory)
+#TODO(low,low) make scilog --show show scilog-stderr if it exists and, if all experiments failed, also show current-stderr of last experiment in that case (if at least one succeeded leave it to user to navigate to the failed experiment) 
+#TODO(med,low) make scilog --show default to no-git (add --git)
+#TODO(?,?) make scilog --show first look through screen sessions
+#TODO(low,med) Store final note in notes.txt, add --update <REASON> to scilog which then flags all previous runs with same config as outdated in their notes.txt  
+#TODO(low,low) add --note flag
+#TODO(med,low) extend scilog ls output by scilog status (running, terminated, error,n_experiments) (store log files)
+#TODO(med,low) include no-shutdown script
 def record(func, variables=None, name=None, base_directory=None, aux_data=None,
             analysis=None, runtime_profile=False, memory_profile=False,
             git=True, no_date=False, parallel=False,
@@ -730,11 +733,7 @@ def _run_single_experiment(arg):
     status = 'failed'
     randomstate = None
     if not external:
-        try:
-            import numpy
-            randomstate = numpy.random.get_state()
-        except ImportError:
-            pass  # Random state only needs to be saved if numpy is used
+        randomstate = np.random.get_state()
     if hasattr(func, '__name__'):#func is function
         temp_func = func
     else:#func is object
