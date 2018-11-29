@@ -1,4 +1,4 @@
-scilog: Effortless bookkeeping of numerical experiments
+scilog: record-keeping for computational experiments
 =======================================================
 :Author: Soeren Wolfers <soeren.wolfers@gmail.com>
 :Organization: King Abdullah University of Science and Technology (KAUST) 
@@ -31,5 +31,5 @@ Requirements
 ------------
 
 - Python 3.6+
-- unix-like operating system
+- Unix-like operating system
 - GNU screen 

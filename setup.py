@@ -28,7 +28,7 @@ setup(
     url = 'https://github.com/soerenwolfers/scilog',
     python_requires='>=3.6',
     long_description=open('README.rst').read(),
-    description='Effortless bookkeeping of numerical experiments',
+    description='Record-keeping for computational experiments',
     author='Soeren Wolfers',
     author_email='soeren.wolfers@gmail.com',
     packages=find_packages(exclude=['*tests']),#,'examples*']),
