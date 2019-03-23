@@ -24,7 +24,7 @@ class PostInstallCommand(install):
         install.run(self)
 setup(
     name='scilog',
-    version='1.7',
+    version='1.7.1',
     url = 'https://github.com/soerenwolfers/scilog',
     python_requires='>=3.6',
     long_description=open('README.rst').read(),
