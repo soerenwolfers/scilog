@@ -32,11 +32,11 @@ import numpy as np
 from matplotlib import pyplot
 from IPython.utils.capture import capture_output
 
-from swutil import sys_info, np_tools, plots, aux
+from swutil import sys_info, np_tools, plots, misc
 from swutil.validation import Positive, Integer, String, List, Tuple,Iterable
 from swutil.logs import Log
 from swutil.hpc import Locker
-from swutil.aux import  string_dialog, no_context, random_word,\
+from swutil.misc import  string_dialog, no_context, random_word,\
     string_from_seconds,input_with_prefill,is_identifier,smart_range
 from swutil.files import append_text, delete_empty_files,\
     delete_empty_directories, find_directories, path_from_keywords
